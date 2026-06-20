@@ -203,3 +203,6 @@ class EvidencePackage:
     included_attachments: List[dict] = field(default_factory=list)
     responsibility_summary: str = ""
     temp_scheme_comparison: str = ""
+    responsibility_conclusion: str = ""
+    primary_scheme_name: str = ""
+    report_purpose: str = "custom"

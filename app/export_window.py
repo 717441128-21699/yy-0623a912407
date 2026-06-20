@@ -17,11 +17,61 @@ from .models import TransportRecord, ImpactAssessment, EvidencePackage, AlertSev
 
 
 class ExportWindow(QWidget):
+    PURPOSE_PRESETS = {
+        "owner": {
+            "title": "关于本次运输温度异常的情况说明及收货建议",
+            "checks": {
+                "timeline": True,
+                "impact": True,
+                "scheme_compare": True,
+                "alerts": False,
+                "responsibility": True,
+                "driver": True,
+                "temp_log": False,
+                "photos": True,
+            },
+            "recipient_idx": 0,
+        },
+        "insurance": {
+            "title": "温度异常证据包（理赔申请用）",
+            "checks": {
+                "timeline": True,
+                "impact": True,
+                "scheme_compare": True,
+                "alerts": True,
+                "responsibility": True,
+                "driver": True,
+                "temp_log": True,
+                "photos": True,
+            },
+            "recipient_idx": 1,
+        },
+        "internal": {
+            "title": "本次运输异常内部复盘报告",
+            "checks": {
+                "timeline": True,
+                "impact": True,
+                "scheme_compare": False,
+                "alerts": True,
+                "responsibility": True,
+                "driver": True,
+                "temp_log": True,
+                "photos": True,
+            },
+            "recipient_idx": 2,
+        },
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._record: Optional[TransportRecord] = None
         self._assessment: Optional[ImpactAssessment] = None
+        self._suppress_changes = False
         self._build_ui()
+        self.cmb_purpose.blockSignals(True)
+        self.cmb_purpose.setCurrentIndex(0)
+        self.cmb_purpose.blockSignals(False)
+        self._on_purpose_changed(0)
 
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -53,6 +103,13 @@ class ExportWindow(QWidget):
         mf.setSpacing(10)
         mf.setContentsMargins(14, 18, 14, 14)
 
+        self.cmb_purpose = QComboBox()
+        self.cmb_purpose.addItem("📤 发货主 / 收货方沟通", "owner")
+        self.cmb_purpose.addItem("🛡  走保险 / 理赔申请", "insurance")
+        self.cmb_purpose.addItem("📋 内部复盘 / 质控考核", "internal")
+        self.cmb_purpose.addItem("⚙  自定义（手动勾选内容）", "custom")
+        self.cmb_purpose.currentIndexChanged.connect(self._on_purpose_changed)
+
         self.cmb_recipient = QComboBox()
         self.cmb_recipient.addItem("货主客服 / 收货方采购", "owner")
         self.cmb_recipient.addItem("保险理赔专员", "insurance")
@@ -62,12 +119,13 @@ class ExportWindow(QWidget):
         self.edt_package_title = QLineEdit()
         self.edt_package_title.setPlaceholderText("自动生成，可修改")
 
+        mf.addRow("报告用途：", self.cmb_purpose)
         mf.addRow("发送对象：", self.cmb_recipient)
         mf.addRow("证据包标题：", self.edt_package_title)
 
         body.addWidget(meta_group)
 
-        content_group = QGroupBox("包含内容")
+        content_group = QGroupBox("包含内容（可手动调整）")
         content_group.setObjectName("formGroup")
         cf = QVBoxLayout(content_group)
         cf.setSpacing(6)
@@ -77,8 +135,12 @@ class ExportWindow(QWidget):
         self.chk_timeline.setChecked(True)
         self.chk_impact = QCheckBox("温区影响评估结论（含风险等级、理赔建议）")
         self.chk_impact.setChecked(True)
+        self.chk_scheme_compare = QCheckBox("多方案温区对比摘要（含建议动作）")
+        self.chk_scheme_compare.setChecked(True)
         self.chk_alerts = QCheckBox("完整告警记录（逐条导出为表格文本）")
         self.chk_alerts.setChecked(True)
+        self.chk_responsibility = QCheckBox("责任链结论页（承运商/设备/收货侧责任划分）")
+        self.chk_responsibility.setChecked(True)
         self.chk_driver_statement = QCheckBox("司机书面处置说明")
         self.chk_driver_statement.setChecked(True)
         self.chk_temp_log = QCheckBox("温度日志明细（CSV 格式，便于二次分析）")
@@ -87,10 +149,15 @@ class ExportWindow(QWidget):
         self.chk_photos.setChecked(True)
 
         for chk in (
-            self.chk_timeline, self.chk_impact, self.chk_alerts,
+            self.chk_timeline, self.chk_impact, self.chk_scheme_compare,
+            self.chk_alerts, self.chk_responsibility,
             self.chk_driver_statement, self.chk_temp_log, self.chk_photos,
         ):
             cf.addWidget(chk)
+            chk.stateChanged.connect(lambda _=0: self._build_preview())
+
+        self.cmb_recipient.currentIndexChanged.connect(lambda _=0: self._build_preview())
+        self.edt_package_title.textChanged.connect(lambda _=0: self._build_preview())
 
         body.addWidget(content_group)
 
@@ -104,6 +171,7 @@ class ExportWindow(QWidget):
         self.chk_zip.setChecked(True)
         self.chk_zip.setToolTip("勾选后导出时会将 Markdown、CSV、司机说明和附件一起打成一个 ZIP 文件，方便邮件/微信发送")
         pf.addWidget(self.chk_zip)
+        self.chk_zip.stateChanged.connect(lambda _=0: self._build_preview())
 
         body.addWidget(pack_group)
 
@@ -210,6 +278,131 @@ class ExportWindow(QWidget):
         date_str = r.departure_time.strftime("%Y%m%d")
         title = f"冷藏车断电事件证据包_{r.record_id}_{date_str}_{r.vehicle_plate.replace('·', '')}"
         self.edt_package_title.setText(title)
+
+    def _on_purpose_changed(self, idx: int):
+        if self._suppress_changes:
+            return
+        key = self.cmb_purpose.itemData(idx)
+        if key not in self.PURPOSE_PRESETS:
+            return
+        preset = self.PURPOSE_PRESETS[key]
+        self._suppress_changes = True
+        try:
+            self.edt_package_title.setText(preset["title"])
+            self.cmb_recipient.setCurrentIndex(preset["recipient_idx"])
+            checks = preset["checks"]
+            self.chk_timeline.setChecked(checks["timeline"])
+            self.chk_impact.setChecked(checks["impact"])
+            self.chk_scheme_compare.setChecked(checks["scheme_compare"])
+            self.chk_alerts.setChecked(checks["alerts"])
+            self.chk_responsibility.setChecked(checks["responsibility"])
+            self.chk_driver_statement.setChecked(checks["driver"])
+            self.chk_temp_log.setChecked(checks["temp_log"])
+            self.chk_photos.setChecked(checks["photos"])
+        finally:
+            self._suppress_changes = False
+        self._build_preview()
+
+    def _build_responsibility_conclusion(self, r: TransportRecord, purpose: str = "custom") -> str:
+        if not self.chk_responsibility.isChecked():
+            return ""
+        all_alerts = r.sorted_alerts()
+        cooler = [a for a in all_alerts if a.alert_type.name == "COOLER_STOP"]
+        driver = [a for a in all_alerts if a.alert_type.name == "DRIVER_CONFIRM"]
+        restore = [a for a in all_alerts if a.alert_type.name in ("POWER_RESTORE", "COOLER_RESTART")]
+        temp_rec = [a for a in all_alerts if a.alert_type.name == "TEMP_RECOVER"]
+        arrival = [a for a in all_alerts if a.alert_type.name in ("UNLOADING", "TEMP_ACCEPT")]
+
+        metrics = {}
+        if cooler and driver:
+            metrics["driver_resp_min"] = (driver[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+        if cooler and restore:
+            metrics["restore_min"] = (restore[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+        if restore and temp_rec:
+            metrics["temp_recover_min"] = (temp_rec[0].timestamp - restore[0].timestamp).total_seconds() / 60
+        if cooler and arrival:
+            metrics["total_impact_min"] = (arrival[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+
+        lines = []
+        lines.append("═" * 80)
+        lines.append("责任链复盘结论".center(80))
+        lines.append("═" * 80)
+
+        lines.append("一、关键节点时间差汇总")
+        lines.append("")
+        if "driver_resp_min" in metrics:
+            m = metrics["driver_resp_min"]
+            mark = "✅" if m <= 10 else "⚠"
+            lines.append(f"  {mark} 司机响应时效：冷机告警后 {m:.0f} 分钟内首次确认（标准：≤10 分钟）")
+        if "restore_min" in metrics:
+            m = metrics["restore_min"]
+            lines.append(f"  ⏱ 维修恢复时效：冷机告警后 {m:.0f} 分钟恢复供电（含支援车程时间）")
+        if "temp_recover_min" in metrics:
+            m = metrics["temp_recover_min"]
+            lines.append(f"  ❄ 冷机拉温时效：恢复供电后 {m:.0f} 分钟车厢温度回归约定温区")
+        if "total_impact_min" in metrics:
+            m = metrics["total_impact_min"]
+            lines.append(f"  📦 全程影响时长：冷机告警到货物验收共 {m:.0f} 分钟")
+        lines.append("")
+
+        lines.append("二、责任划分与说明")
+        lines.append("")
+        carrier_liability = []
+        equipment_liability = []
+        receiver_suggestion = []
+
+        if "driver_resp_min" in metrics and metrics["driver_resp_min"] > 10:
+            carrier_liability.append(f"司机在冷机告警后 {metrics['driver_resp_min']:.0f} 分钟才确认，响应不及时")
+        if driver and driver[0].operator and "未按规定每30分钟巡检" in (driver[0].description or ""):
+            carrier_liability.append("司机未按规定执行每30分钟车厢温度巡检")
+        if cooler:
+            equipment_liability.append(f"冷机于 {cooler[0].timestamp.strftime('%H:%M')} 非预期停转，属于设备故障")
+        if "temp_recover_min" in metrics and metrics["temp_recover_min"] > 60:
+            equipment_liability.append(f"冷机拉温效率偏低（恢复供电后 {metrics['temp_recover_min']:.0f} 分钟才回温区）")
+        receiver_suggestion.append("建议收货方开箱抽检货品中心温度后再决定是否收货")
+        if self._assessment and self._assessment.risk_level == "高":
+            receiver_suggestion.append("鉴于风险等级较高，建议抽样比例不低于 10%")
+        if self._assessment and self._assessment.peak_temperature and self._assessment.peak_temperature > -12:
+            receiver_suggestion.append(f"峰值温度达到 {self._assessment.peak_temperature:.1f}℃，建议重点检查是否存在变色、软化、异味")
+        receiver_suggestion.append("如抽检不合格，请保留不合格批次包装并拍照固定证据")
+
+        if carrier_liability:
+            lines.append("  🚚 承运商责任：")
+            for c in carrier_liability:
+                lines.append(f"    • {c}")
+            lines.append("")
+        if equipment_liability:
+            lines.append("  🔧 设备故障：")
+            for e in equipment_liability:
+                lines.append(f"    • {e}")
+            lines.append("")
+        if receiver_suggestion:
+            lines.append("  📮 收货侧验收建议：")
+            for s in receiver_suggestion:
+                lines.append(f"    • {s}")
+            lines.append("")
+
+        lines.append("三、发给货主沟通话术（可直接复制使用）")
+        lines.append("")
+        if purpose == "owner":
+            tone = "沟通说明："
+        elif purpose == "insurance":
+            tone = "理赔说明："
+        elif purpose == "internal":
+            tone = "内部通报："
+        else:
+            tone = "说明："
+        lines.append(f"  {tone}本次运输（{r.record_id} / {r.vehicle_plate}）冷机于 {cooler[0].timestamp.strftime('%H:%M') if cooler else '--:--'} 发生异常停转，")
+        if "driver_resp_min" in metrics:
+            lines.append(f"  司机于 {metrics['driver_resp_min']:.0f} 分钟后确认并采取应急措施，维修团队于 {metrics['restore_min']:.0f} 分钟后到场修复，")
+        if "temp_recover_min" in metrics:
+            lines.append(f"  温度于 {metrics['temp_recover_min']:.0f} 分钟后回归约定温区。")
+        if self._assessment:
+            lines.append(f"  按【{self._assessment.scheme_name or '合同约定'}】口径评估，越线时长 {self._assessment.exceed_duration_minutes} 分钟，")
+            lines.append(f"  容忍值 {self._assessment.tolerance_minutes} 分钟，风险等级 {self._assessment.risk_level}，结论为「{self._assessment.conclusion}」。")
+        lines.append(f"  我们已组织维修并复盘整改，附件为完整证据链。如需进一步沟通，请随时联系。")
+        lines.append("")
+        return "\n".join(lines)
 
     def _refresh_photo_list(self):
         self.list_photos.clear()
@@ -325,72 +518,93 @@ class ExportWindow(QWidget):
         }
 
     def _suggested_action(self, eval_row: dict) -> str:
-        if eval_row["is_acceptable"] and eval_row["total_minutes"] == 0:
-            return "无异常，归档即可"
-        if eval_row["is_acceptable"]:
-            return "可正常收货，内部质控记录备案"
-        exceed = eval_row["total_minutes"] - eval_row["tolerance"]
-        if eval_row["cargo"].cargo_type == CargoType.PHARMACEUTICAL:
-            return "立即启动隔离抽检，联系货主按偏差流程处理"
-        if exceed <= 30:
-            return "与货主协商折扣收货，内部追责司机响应延迟"
-        if exceed <= 120:
-            return "建议保险立案，同步评估货品品质风险"
-        return "高风险拒收/报废，启动保险理赔并保存完整证据链"
+        try:
+            if eval_row["is_acceptable"] and eval_row["total_minutes"] == 0:
+                return "无异常，归档即可"
+            if eval_row["is_acceptable"]:
+                return "可正常收货，内部质控记录备案"
+            exceed = eval_row["total_minutes"] - eval_row["tolerance"]
+            cargo = eval_row.get("cargo")
+            if cargo and hasattr(cargo, "cargo_type") and cargo.cargo_type == CargoType.PHARMACEUTICAL:
+                return "立即启动隔离抽检，联系货主按偏差流程处理"
+            if exceed <= 30:
+                return "与货主协商折扣收货，内部追责司机响应延迟"
+            if exceed <= 120:
+                return "建议保险立案，同步评估货品品质风险"
+            return "高风险拒收/报废，启动保险理赔并保存完整证据链"
+        except Exception as e:
+            return f"建议动作生成异常: {e}"
 
-    def _build_scheme_comparison(self, r: TransportRecord) -> str:
-        if not self.chk_impact.isChecked():
-            return ""
-        schemes = list(r.temp_schemes or [])
-        if r.cargo and not any(
-            s.cargo.temp_min == r.cargo.temp_min and s.cargo.temp_max == r.cargo.temp_max
-            for s in schemes
-        ):
-            schemes.append(TempScheme(name="自定义（当前评估）", cargo=r.cargo, scheme_type="自定义"))
-        if not schemes:
-            return ""
-        rows = []
-        for s in schemes:
-            ev = self._static_evaluate_scheme(r, s.name, s.cargo)
-            if ev:
-                rows.append(ev)
-        if not rows:
-            return ""
-        lines = []
-        lines.append("┌" + "─" * 14 + "┬" + "─" * 10 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 16 + "┬" + "─" * 8 + "┬" + "─" * 34 + "┐")
-        lines.append("│" + "方案名称".center(14) + "│" + "温区(℃)".center(10) + "│" + "容忍".center(8) + "│" + "越线分钟".center(10) + "│" + "结论".center(16) + "│" + "风险".center(8) + "│" + "建议动作".center(34) + "│")
-        lines.append("├" + "─" * 14 + "┼" + "─" * 10 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 16 + "┼" + "─" * 8 + "┼" + "─" * 34 + "┤")
-        for row in rows:
-            name = row["name"][:13]
-            temp_range = f"{row['tmin']:.0f}~{row['tmax']:.0f}"
-            tol = f"{row['tolerance']}分"
-            exceed = f"{row['total_minutes']}分"
-            marker = "●" if (row["is_acceptable"] and row["total_minutes"] == 0) else ("▲" if row["is_acceptable"] else "✗")
-            concl = f"{marker}{row['conclusion'][:6]}"
-            risk = row["risk"]
-            act = self._suggested_action(row)[:33]
-            lines.append(
-                "│" + name.center(14) + "│" + temp_range.center(10) + "│" + tol.center(8) + "│"
-                + exceed.center(10) + "│" + concl.center(16) + "│" + risk.center(8) + "│"
-                + act.center(34) + "│"
-            )
-        lines.append("└" + "─" * 14 + "┴" + "─" * 10 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 16 + "┴" + "─" * 8 + "┴" + "─" * 34 + "┘")
-        lines.append("")
-        lines.append("符号说明：● 全程稳定  ▲ 短时越线但可接受  ✗ 超过容忍阈值")
-        ok = [r_ for r_ in rows if r_["is_acceptable"]]
-        bad = [r_ for r_ in rows if not r_["is_acceptable"]]
-        if ok and bad:
-            worst = max(bad, key=lambda c: c["total_minutes"])
-            best = min(ok, key=lambda c: c["total_minutes"])
-            lines.append(f"综合判定：存在口径分歧。最严方案【{worst['name']}】超出容忍 {worst['total_minutes'] - worst['tolerance']} 分钟；最松方案【{best['name']}】尚余 {best['tolerance'] - best['total_minutes']} 分钟。")
-            lines.append("建议：优先按货主合同口径与收货方沟通；保险口径同步准备理赔材料，按最坏口径申请。")
-        elif bad:
-            lines.append("综合判定：所有业务口径均判定越线超过容忍阈值。")
-            lines.append("建议：立即启动保险理赔流程，同步联系货主告知风险并安排隔离抽检。")
-        elif len(rows) > 1:
-            lines.append("综合判定：所有业务口径均判定可接受或温区稳定。")
-            lines.append("建议：正常收货归档，内部质控按严格口径考核司机处置时效。")
-        return "\n".join(lines)
+    def _build_scheme_comparison(self, r: TransportRecord, primary_scheme_name: str = "") -> str:
+        try:
+            if not self.chk_scheme_compare.isChecked():
+                return ""
+            schemes = list(r.temp_schemes or [])
+            if r.cargo and not any(
+                s.cargo.temp_min == r.cargo.temp_min and s.cargo.temp_max == r.cargo.temp_max
+                for s in schemes
+            ):
+                schemes.append(TempScheme(name="自定义（当前评估）", cargo=r.cargo, scheme_type="自定义"))
+            if not schemes:
+                return ""
+            rows = []
+            for s in schemes:
+                try:
+                    ev = self._static_evaluate_scheme(r, s.name, s.cargo)
+                    if ev:
+                        ev["_is_primary"] = (s.name == primary_scheme_name)
+                        rows.append(ev)
+                except Exception as ee:
+                    rows.append({
+                        "name": s.name, "tmin": s.cargo.temp_min, "tmax": s.cargo.temp_max,
+                        "tolerance": s.cargo.tolerance_minutes, "total_minutes": 0, "peak": None,
+                        "is_acceptable": True, "conclusion": f"评估失败: {ee}", "risk": "?",
+                        "cargo": s.cargo, "_is_primary": (s.name == primary_scheme_name),
+                    })
+            if not rows:
+                return ""
+            lines = []
+            lines.append("┌" + "─" * 14 + "┬" + "─" * 10 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 16 + "┬" + "─" * 8 + "┬" + "─" * 34 + "┐")
+            lines.append("│" + "方案名称".center(14) + "│" + "温区(℃)".center(10) + "│" + "容忍".center(8) + "│" + "越线分钟".center(10) + "│" + "结论".center(16) + "│" + "风险".center(8) + "│" + "建议动作".center(34) + "│")
+            lines.append("├" + "─" * 14 + "┼" + "─" * 10 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 16 + "┼" + "─" * 8 + "┼" + "─" * 34 + "┤")
+            for row in rows:
+                name = row["name"][:13]
+                if row.get("_is_primary"):
+                    name = "★" + name[:12]
+                temp_range = f"{row['tmin']:.0f}~{row['tmax']:.0f}"
+                tol = f"{row['tolerance']}分"
+                exceed = f"{row['total_minutes']}分"
+                marker = "●" if (row["is_acceptable"] and row["total_minutes"] == 0) else ("▲" if row["is_acceptable"] else "✗")
+                concl = f"{marker}{row['conclusion'][:6]}"
+                risk = row["risk"]
+                act = self._suggested_action(row)[:33]
+                lines.append(
+                    "│" + name.center(14) + "│" + temp_range.center(10) + "│" + tol.center(8) + "│"
+                    + exceed.center(10) + "│" + concl.center(16) + "│" + risk.center(8) + "│"
+                    + act.center(34) + "│"
+                )
+            lines.append("└" + "─" * 14 + "┴" + "─" * 10 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 16 + "┴" + "─" * 8 + "┴" + "─" * 34 + "┘")
+            lines.append("")
+            lines.append("符号说明：● 全程稳定  ▲ 短时越线但可接受  ✗ 超过容忍阈值    ★ 当前采用口径")
+            ok = [r_ for r_ in rows if r_["is_acceptable"]]
+            bad = [r_ for r_ in rows if not r_["is_acceptable"]]
+            if ok and bad:
+                worst = max(bad, key=lambda c: c["total_minutes"])
+                best = min(ok, key=lambda c: c["total_minutes"])
+                lines.append(f"综合判定：存在口径分歧。最严方案【{worst['name']}】超出容忍 {worst['total_minutes'] - worst['tolerance']} 分钟；最松方案【{best['name']}】尚余 {best['tolerance'] - best['total_minutes']} 分钟。")
+                lines.append("建议：优先按货主合同口径与收货方沟通；保险口径同步准备理赔材料，按最坏口径申请。")
+            elif bad:
+                lines.append("综合判定：所有业务口径均判定越线超过容忍阈值。")
+                lines.append("建议：立即启动保险理赔流程，同步联系货主告知风险并安排隔离抽检。")
+            elif len(rows) > 1:
+                lines.append("综合判定：所有业务口径均判定可接受或温区稳定。")
+                lines.append("建议：正常收货归档，内部质控按严格口径考核司机处置时效。")
+            if primary_scheme_name:
+                lines.insert(1, f"【主结论采用口径】：{primary_scheme_name}    （其余方案为对比参考，不作为最终判定依据）")
+                lines.insert(2, "─" * 100)
+            return "\n".join(lines)
+        except Exception as e:
+            return f"多方案对比生成异常: {e}\n（单个方案评估失败不影响其他方案结果）"
 
     def _build_package(self) -> Optional[EvidencePackage]:
         if not self._record:
@@ -407,10 +621,25 @@ class ExportWindow(QWidget):
             return None
 
         r = self._record
+        report_purpose = self.cmb_purpose.currentData() or "custom"
+        primary_scheme_name = ""
+        if self._assessment and self._assessment.scheme_name:
+            primary_scheme_name = self._assessment.scheme_name
+        elif self._record and self._record.temp_schemes and report_purpose != "custom":
+            priority = {"owner": 0, "insurance": 1, "internal": 2, "custom": -1}
+            target = {"owner": "货主合同", "insurance": "保险条款", "internal": "内部质控"}
+            tgt = target.get(report_purpose)
+            if tgt:
+                for s in self._record.temp_schemes:
+                    if s.scheme_type == tgt:
+                        primary_scheme_name = s.name
+                        break
+
         timeline_summary = self._build_timeline_summary(r)
         responsibility_summary = self._build_responsibility_summary(r)
-        impact_summary = self._build_impact_summary(r)
-        temp_scheme_comparison = self._build_scheme_comparison(r)
+        responsibility_conclusion = self._build_responsibility_conclusion(r, report_purpose)
+        impact_summary = self._build_impact_summary(r, primary_scheme_name, report_purpose)
+        temp_scheme_comparison = self._build_scheme_comparison(r, primary_scheme_name)
         alert_records = self._build_alert_records(r, recipient_key)
         driver_statement = r.driver_notes if self.chk_driver_statement.isChecked() else ""
         included_attachments = self._collect_checked_attachments() if self.chk_photos.isChecked() else []
@@ -428,6 +657,9 @@ class ExportWindow(QWidget):
             included_attachments=included_attachments,
             responsibility_summary=responsibility_summary,
             temp_scheme_comparison=temp_scheme_comparison,
+            responsibility_conclusion=responsibility_conclusion,
+            primary_scheme_name=primary_scheme_name,
+            report_purpose=report_purpose,
         )
         return package
 
@@ -504,17 +736,20 @@ class ExportWindow(QWidget):
             lines.append(f"【响应时效】冷机停转 → 司机首次确认：{lag:.0f} 分钟")
         return "\n".join(lines)
 
-    def _build_impact_summary(self, r: TransportRecord) -> str:
+    def _build_impact_summary(self, r: TransportRecord, primary_scheme_name: str = "", report_purpose: str = "custom") -> str:
         if not self.chk_impact.isChecked():
             return ""
         if not self._assessment or not r.cargo:
             return "（未执行温区影响评估）"
         a = self._assessment
         c = r.cargo
+        scheme_name = primary_scheme_name or a.scheme_name or "合同约定"
         lines = []
         lines.append("═" * 80)
         lines.append("温区影响评估结论".center(80))
         lines.append("═" * 80)
+        lines.append(f"【当前采用口径】：★ {scheme_name}")
+        lines.append("    （本报告主结论基于此口径判定；其余方案仅作对比参考，不作为最终依据）")
         lines.append(f"货品：{c.cargo_name}（{c.cargo_type.value}）")
         lines.append(f"约定温区：{c.temp_min:.1f}℃ ~ {c.temp_max:.1f}℃　容忍越线：{a.tolerance_minutes} 分钟")
         lines.append(f"越线时段：{a.affected_period}")
@@ -561,6 +796,10 @@ class ExportWindow(QWidget):
         if p.responsibility_summary:
             parts.append(">>> 〇、责任链阶段分组说明")
             parts.append(p.responsibility_summary)
+            parts.append("")
+        if p.responsibility_conclusion:
+            parts.append(">>> 〇-一、责任链复盘结论")
+            parts.append(p.responsibility_conclusion)
             parts.append("")
         if p.timeline_summary:
             parts.append(">>> 一、告警时间轴汇总")
@@ -793,6 +1032,16 @@ class ExportWindow(QWidget):
             lines.append("")
             lines.append("```")
             lines.append(p.responsibility_summary)
+            lines.append("```")
+            lines.append("")
+        if p.responsibility_conclusion:
+            lines.append("## 二-一、责任链复盘结论")
+            lines.append("")
+            lines.append("> 把司机响应、维修到场、温度恢复、到货验收等关键时间差汇总，")
+            lines.append("> 区分承运商责任、设备故障和收货侧验收建议，并提供可直接发给货主的沟通话术。")
+            lines.append("")
+            lines.append("```")
+            lines.append(p.responsibility_conclusion)
             lines.append("```")
             lines.append("")
         if p.timeline_summary:
