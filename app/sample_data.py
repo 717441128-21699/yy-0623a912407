@@ -1,8 +1,10 @@
+import os
 import random
 from datetime import datetime, timedelta
 from .models import (
     TransportRecord, AlertEvent, AlertType, AlertSeverity,
-    CargoConfig, CargoType, TemperatureReading
+    CargoConfig, CargoType, TemperatureReading,
+    EvidenceAttachment, TempScheme
 )
 
 
@@ -145,6 +147,53 @@ def generate_sample_record() -> TransportRecord:
         "03:05安全抵达余杭生鲜仓，全程无超速、无违规驾驶行为。"
     )
 
+    attachments = _build_sample_attachments(record_id, vehicle_plate)
+
+    temp_schemes = [
+        TempScheme(
+            name="货主合同温区",
+            scheme_type="货主合同",
+            description="收货合同第3.2条：冷冻货品全程≤-18℃，单次连续越线≤30分钟，累计≤60分钟",
+            cargo=CargoConfig(
+                cargo_type=CargoType.FROZEN,
+                cargo_name=cargo.cargo_name,
+                temp_min=-25.0,
+                temp_max=-18.0,
+                tolerance_minutes=30,
+                shipment_weight=cargo.shipment_weight,
+                shipment_value=cargo.shipment_value,
+            )
+        ),
+        TempScheme(
+            name="保险条款温区",
+            scheme_type="保险条款",
+            description="国内冷链货物险2025版：温度偏离约定温区≤15分钟免赔；15~60分钟按比例赔付；≥60分钟全额立案",
+            cargo=CargoConfig(
+                cargo_type=CargoType.FROZEN,
+                cargo_name=cargo.cargo_name,
+                temp_min=-22.0,
+                temp_max=-15.0,
+                tolerance_minutes=15,
+                shipment_weight=cargo.shipment_weight,
+                shipment_value=cargo.shipment_value,
+            )
+        ),
+        TempScheme(
+            name="内部质控温区",
+            scheme_type="内部质控",
+            description="车队内部SOP第4.1条：严格管控标准，超过-19℃即触发内部警告；容忍≥90分钟直接约谈司机",
+            cargo=CargoConfig(
+                cargo_type=CargoType.FROZEN,
+                cargo_name=cargo.cargo_name,
+                temp_min=-24.0,
+                temp_max=-19.0,
+                tolerance_minutes=90,
+                shipment_weight=cargo.shipment_weight,
+                shipment_value=cargo.shipment_value,
+            )
+        ),
+    ]
+
     record = TransportRecord(
         record_id=record_id,
         vehicle_plate=vehicle_plate,
@@ -159,20 +208,52 @@ def generate_sample_record() -> TransportRecord:
         alerts=alerts,
         temperature_log=temp_log,
         driver_notes=driver_notes,
-        track_images=[
-            "行驶轨迹：上海奉贤→沪昆高速→杭州余杭（全程178km）",
-            "关键节点1：嘉兴段K128冷机停机点",
-            "关键节点2：长安服务区维修供电点",
-        ],
-        photo_paths=[
-            "冷机故障仪表盘照片",
-            "车厢内部温度记录仪照片",
-            "维修现场外接发电机照片",
-            "到货时货品外观抽检照片",
-        ]
+        attachments=attachments,
+        temp_schemes=temp_schemes,
     )
 
     return record
+
+
+def _build_sample_attachments(record_id: str, plate: str) -> list:
+    import sys
+    sample_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "_sample_photos"
+    )
+    sample_dir = os.path.abspath(sample_dir)
+
+    plat_clean = plate.replace("·", "").replace("·", "")
+    date_str = datetime.now().strftime("%Y%m%d")
+
+    expected_files = [
+        ("行驶轨迹：上海奉贤→沪昆高速→杭州余杭（全程178km）", "track",
+         f"{record_id}_track_overview_{plat_clean}_{date_str}.png"),
+        ("关键节点1：嘉兴段K128冷机停机点", "track",
+         f"{record_id}_track_stop_point_{plat_clean}_{date_str}.png"),
+        ("关键节点2：长安服务区维修供电点", "track",
+         f"{record_id}_track_repair_point_{plat_clean}_{date_str}.png"),
+        ("冷机故障仪表盘照片", "photo",
+         f"{record_id}_photo_cooler_dashboard_{plat_clean}_{date_str}.jpg"),
+        ("车厢内部温度记录仪照片", "photo",
+         f"{record_id}_photo_temp_recorder_{plat_clean}_{date_str}.jpg"),
+        ("维修现场外接发电机照片", "photo",
+         f"{record_id}_photo_repair_generator_{plat_clean}_{date_str}.jpg"),
+        ("到货时货品外观抽检照片", "photo",
+         f"{record_id}_photo_arrival_inspection_{plat_clean}_{date_str}.jpg"),
+    ]
+
+    attachments = []
+    for desc, cat, filename in expected_files:
+        full_path = os.path.join(sample_dir, filename)
+        exists = os.path.isfile(full_path)
+        attachments.append(EvidenceAttachment(
+            description=desc,
+            category=cat,
+            file_path=full_path if exists else None,
+            exists=exists,
+        ))
+
+    return attachments
 
 
 def _generate_temperature_log(start: datetime, end: datetime, incident_start: datetime) -> list:

@@ -1,9 +1,11 @@
 import os
+import shutil
+import zipfile
 from datetime import datetime
 from typing import Optional, List
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QPainter, QColor, QFont, QPen, QBrush
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QComboBox, QLineEdit, QCheckBox, QListWidget, QListWidgetItem,
@@ -11,7 +13,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QProgressBar
 )
 
-from .models import TransportRecord, ImpactAssessment, EvidencePackage, AlertSeverity
+from .models import TransportRecord, ImpactAssessment, EvidencePackage, AlertSeverity, ResponsibilityPhase
 
 
 class ExportWindow(QWidget):
@@ -91,6 +93,19 @@ class ExportWindow(QWidget):
             cf.addWidget(chk)
 
         body.addWidget(content_group)
+
+        pack_group = QGroupBox("打包选项")
+        pack_group.setObjectName("formGroup")
+        pf = QVBoxLayout(pack_group)
+        pf.setSpacing(6)
+        pf.setContentsMargins(14, 18, 14, 14)
+
+        self.chk_zip = QCheckBox("导出后自动打包为 ZIP 压缩包（文件名含运输编号 + 车牌）")
+        self.chk_zip.setChecked(True)
+        self.chk_zip.setToolTip("勾选后导出时会将 Markdown、CSV、司机说明和附件一起打成一个 ZIP 文件，方便邮件/微信发送")
+        pf.addWidget(self.chk_zip)
+
+        body.addWidget(pack_group)
 
         list_group = QGroupBox("现场照片 / 截图（可勾选）")
         list_group.setObjectName("formGroup")
@@ -200,24 +215,53 @@ class ExportWindow(QWidget):
         self.list_photos.clear()
         if not self._record:
             return
-        for item in self._record.track_images:
-            self._add_photo_item(f"[轨迹] {item}", True)
-        for item in self._record.photo_paths:
-            self._add_photo_item(f"[照片] {item}", True)
+        for idx, att in enumerate(self._record.attachments):
+            tag = "[轨迹]" if att.category == "track" else "[照片]"
+            if att.exists:
+                text = f"{tag} {att.description}"
+            else:
+                text = f"{tag} {att.description}  ⚠【原始文件缺失】"
+            self._add_photo_item(text, True, idx, att.exists)
 
-    def _add_photo_item(self, text: str, checked: bool):
+    def _add_photo_item(self, text: str, checked: bool, attach_idx: int, exists: bool):
         it = QListWidgetItem(text)
         it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
         it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        it.setData(Qt.UserRole, attach_idx)
+        if not exists:
+            it.setForeground(QColor("#C62828"))
         self.list_photos.addItem(it)
 
-    def _collect_checked_photos(self) -> List[str]:
+    def _collect_checked_attachments(self) -> List[dict]:
         result = []
+        if not self._record:
+            return result
         for i in range(self.list_photos.count()):
             it = self.list_photos.item(i)
             if it.checkState() == Qt.Checked:
-                result.append(it.text())
+                idx = it.data(Qt.UserRole)
+                if idx is not None and 0 <= idx < len(self._record.attachments):
+                    att = self._record.attachments[idx]
+                    result.append({
+                        "index": len(result) + 1,
+                        "attach_idx": idx,
+                        "type": "轨迹截图" if att.category == "track" else "现场照片",
+                        "desc": att.description,
+                        "category": att.category,
+                        "file_path": att.file_path,
+                        "exists": att.exists,
+                    })
         return result
+
+    RESP_PHASE_NAMES = {
+        ResponsibilityPhase.LOADING_SEAL: "① 装货封签阶段",
+        ResponsibilityPhase.DEPARTURE_POWER: "② 出发切换冷源阶段",
+        ResponsibilityPhase.EQUIPMENT_FAULT: "③ 设备故障阶段",
+        ResponsibilityPhase.DRIVER_RESPONSE: "④ 司机响应阶段",
+        ResponsibilityPhase.MAINTENANCE_RECOVERY: "⑤ 维修恢复阶段",
+        ResponsibilityPhase.NORMAL_TRANSIT: "⑥ 后续在途阶段",
+        ResponsibilityPhase.ARRIVAL_ACCEPTANCE: "⑦ 到货验收阶段",
+    }
 
     def _build_package(self) -> Optional[EvidencePackage]:
         if not self._record:
@@ -235,10 +279,11 @@ class ExportWindow(QWidget):
 
         r = self._record
         timeline_summary = self._build_timeline_summary(r)
+        responsibility_summary = self._build_responsibility_summary(r)
         impact_summary = self._build_impact_summary(r)
         alert_records = self._build_alert_records(r, recipient_key)
         driver_statement = r.driver_notes if self.chk_driver_statement.isChecked() else ""
-        included_images = self._collect_checked_photos() if self.chk_photos.isChecked() else []
+        included_attachments = self._collect_checked_attachments() if self.chk_photos.isChecked() else []
 
         package = EvidencePackage(
             package_title=self.edt_package_title.text().strip() or "冷藏车断电证据包",
@@ -250,9 +295,48 @@ class ExportWindow(QWidget):
             impact_summary=impact_summary,
             alert_records=alert_records,
             driver_statement=driver_statement,
-            included_images=included_images,
+            included_attachments=included_attachments,
+            responsibility_summary=responsibility_summary,
         )
         return package
+
+    def _build_responsibility_summary(self, r: TransportRecord) -> str:
+        if not self.chk_timeline.isChecked():
+            return ""
+        grouped = r.group_alerts_by_responsibility()
+        if not grouped:
+            return ""
+        lines = []
+        lines.append("┌" + "─" * 76 + "┐")
+        lines.append("│" + "责任链阶段分组说明".center(76) + "│")
+        lines.append("├" + "─" * 76 + "┤")
+        for phase, alerts in grouped.items():
+            phase_name = self.RESP_PHASE_NAMES.get(phase, phase.value)
+            t_start = min(a.timestamp for a in alerts).strftime("%m-%d %H:%M")
+            t_end = max(a.timestamp for a in alerts).strftime("%m-%d %H:%M")
+            lines.append(f"│ {phase_name:<22} {t_start} ~ {t_end}  共{len(alerts):>2}个节点".ljust(74) + " │")
+        lines.append("├" + "─" * 76 + "┤")
+
+        all_alerts = r.sorted_alerts()
+        cooler = [a for a in all_alerts if a.alert_type.name == "COOLER_STOP"]
+        driver = [a for a in all_alerts if a.alert_type.name == "DRIVER_CONFIRM"]
+        restore = [a for a in all_alerts if a.alert_type.name in ("POWER_RESTORE", "COOLER_RESTART")]
+        temp_rec = [a for a in all_alerts if a.alert_type.name == "TEMP_RECOVER"]
+
+        lines.append("│" + "关键节点时间差".center(76) + "│")
+        lines.append("├" + "─" * 76 + "┤")
+        if cooler and driver:
+            lag = (driver[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+            mark = "✓" if lag <= 10 else "✗"
+            lines.append(f"│  {mark}  冷机停转 → 司机首次确认  :  {lag:>6.1f} 分钟（建议 ≤ 10 分钟）".ljust(74) + " │")
+        if cooler and restore:
+            lag = (restore[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+            lines.append(f"│  ●  冷机停转 → 恢复供电成功  :  {lag:>6.1f} 分钟（含支援车程）".ljust(74) + " │")
+        if restore and temp_rec:
+            lag = (temp_rec[0].timestamp - restore[0].timestamp).total_seconds() / 60
+            lines.append(f"│  ●  恢复供电 → 温度回归温区  :  {lag:>6.1f} 分钟（冷机拉温时间）".ljust(74) + " │")
+        lines.append("└" + "─" * 76 + "┘")
+        return "\n".join(lines)
 
     def _build_timeline_summary(self, r: TransportRecord) -> str:
         if not self.chk_timeline.isChecked():
@@ -340,8 +424,13 @@ class ExportWindow(QWidget):
         parts.append(f"运输编号：{p.record_id}　　车牌：{p.vehicle_plate}")
         parts.append(f"运输路线：{p.route}")
         parts.append(f"发送对象：{self.cmb_recipient.currentText()}")
+        parts.append(f"打包为ZIP：{'是' if self.chk_zip.isChecked() else '否'}")
         parts.append("")
 
+        if p.responsibility_summary:
+            parts.append(">>> 〇、责任链阶段分组说明")
+            parts.append(p.responsibility_summary)
+            parts.append("")
         if p.timeline_summary:
             parts.append(">>> 一、告警时间轴汇总")
             parts.append(p.timeline_summary)
@@ -360,10 +449,16 @@ class ExportWindow(QWidget):
             parts.append(">>> 四、司机书面处置说明")
             parts.append(p.driver_statement)
             parts.append("")
-        if p.included_images:
+        if p.included_attachments:
             parts.append(">>> 五、附件清单（照片 / 轨迹截图）")
-            for i, name in enumerate(p.included_images, 1):
-                parts.append(f"  {i:>2}. {name}")
+            missing_count = 0
+            for att in p.included_attachments:
+                status = "" if att["exists"] else "  ⚠【原始文件缺失，无法导出】"
+                if not att["exists"]:
+                    missing_count += 1
+                parts.append(f"  {att['index']:>2}. [{att['type']}] {att['desc']}{status}")
+            if missing_count:
+                parts.append(f"  （共 {len(p.included_attachments)} 项，其中 {missing_count} 项原始文件缺失，缺失项将在报告中醒目标注）")
             parts.append("")
         if self.chk_temp_log.isChecked() and self._record:
             parts.append(">>> 六、温度日志明细（CSV 文件）")
@@ -400,7 +495,7 @@ class ExportWindow(QWidget):
 
         try:
             self.progress.setVisible(True)
-            self.progress.setValue(10)
+            self.progress.setValue(8)
 
             pkg_dir = os.path.join(out_dir, default_name)
             os.makedirs(pkg_dir, exist_ok=True)
@@ -409,37 +504,64 @@ class ExportWindow(QWidget):
 
             base = os.path.join(pkg_dir, default_name)
 
-            self.progress.setValue(25)
-            included_image_files = []
-            if self.chk_photos.isChecked() and pkg.included_images:
-                for i, name in enumerate(pkg.included_images, 1):
-                    tag = "photo" if name.startswith("[照片]") else "track"
-                    safe_name = f"{tag}_{i:02d}_{self._sanitize_filename(name)}.png"
-                    full_path = os.path.join(attachments_dir, safe_name)
-                    self._generate_placeholder_image(
-                        full_path, name, i, len(pkg.included_images),
-                        self._record.vehicle_plate if self._record else ""
-                    )
-                    included_image_files.append({
-                        "index": i,
-                        "type": "照片" if name.startswith("[照片]") else "轨迹截图",
-                        "desc": name.replace("[照片] ", "").replace("[轨迹] ", ""),
-                        "filename": os.path.join("attachments", safe_name),
-                    })
-                    self.progress.setValue(25 + int(40 * i / max(1, len(pkg.included_images))))
+            self.progress.setValue(20)
+            exported_attachments = []
+            missing_attachments = []
+            if self.chk_photos.isChecked() and pkg.included_attachments:
+                total = len(pkg.included_attachments)
+                for i, att in enumerate(pkg.included_attachments, 1):
+                    idx = att["index"]
+                    cat = att["category"]
+                    desc = att["desc"]
+                    exists = att["exists"]
+                    src_path = att["file_path"]
+                    tag = "轨迹" if cat == "track" else "照片"
+                    safe_desc = self._sanitize_filename(desc)
+                    ext = ".png" if cat == "track" else ".jpg"
+                    safe_name = f"{tag}_{idx:02d}_{safe_desc}{ext}"
+                    dst_full = os.path.join(attachments_dir, safe_name)
+                    rel_path = f"attachments/{safe_name}"
+
+                    if exists and src_path and os.path.isfile(src_path):
+                        shutil.copyfile(src_path, dst_full)
+                        exported_attachments.append({
+                            "index": idx,
+                            "type": att["type"],
+                            "desc": desc,
+                            "filename": rel_path,
+                            "exists": True,
+                        })
+                    else:
+                        missing_attachments.append({
+                            "index": idx,
+                            "type": att["type"],
+                            "desc": desc,
+                            "orig_path": src_path or "(原始路径未记录)",
+                        })
+                        exported_attachments.append({
+                            "index": idx,
+                            "type": att["type"],
+                            "desc": desc,
+                            "filename": None,
+                            "exists": False,
+                            "orig_path": src_path or "(原始路径未记录)",
+                        })
+                    self.progress.setValue(20 + int(35 * i / max(1, total)))
 
             readme_path = base + "_证据包说明.md"
-            self.progress.setValue(70)
+            self.progress.setValue(62)
             with open(readme_path, "w", encoding="utf-8") as f:
-                f.write(self._build_readme_content(pkg, included_image_files))
+                f.write(self._build_readme_content(pkg, exported_attachments))
 
-            self.progress.setValue(80)
+            self.progress.setValue(72)
+            csv_path = None
             if pkg.alert_records:
                 csv_path = base + "_告警记录.csv"
                 with open(csv_path, "w", encoding="utf-8-sig") as f:
                     f.write("\n".join(pkg.alert_records) + "\n")
 
-            self.progress.setValue(88)
+            self.progress.setValue(82)
+            tlog_path = None
             if self.chk_temp_log.isChecked() and self._record:
                 tlog_path = base + "_温度日志.csv"
                 with open(tlog_path, "w", encoding="utf-8-sig") as f:
@@ -450,9 +572,10 @@ class ExportWindow(QWidget):
                             f"{r.temperature:.1f},{r.zone}\n"
                         )
 
-            self.progress.setValue(94)
-            driver_path = base + "_司机处置说明.txt"
+            self.progress.setValue(90)
+            driver_path = None
             if pkg.driver_statement:
+                driver_path = base + "_司机处置说明.txt"
                 with open(driver_path, "w", encoding="utf-8") as f:
                     f.write(
                         f"运输编号：{pkg.record_id}\n"
@@ -464,23 +587,45 @@ class ExportWindow(QWidget):
                         + pkg.driver_statement
                     )
 
-            self.progress.setValue(100)
-            file_list = [f"  • {os.path.relpath(readme_path, pkg_dir)}（主文件，双击打开）\n"]
-            if pkg.alert_records:
-                file_list.append(f"  • {os.path.relpath(csv_path, pkg_dir)}\n")
-            if self.chk_temp_log.isChecked() and self._record:
-                file_list.append(f"  • {os.path.relpath(tlog_path, pkg_dir)}\n")
-            if pkg.driver_statement:
-                file_list.append(f"  • {os.path.relpath(driver_path, pkg_dir)}\n")
-            if included_image_files:
-                file_list.append(f"  • attachments/  （含 {len(included_image_files)} 张照片/截图）\n")
+            self.progress.setValue(94)
 
-            QMessageBox.information(
-                self, "导出成功",
-                f"证据包已导出至：\n{pkg_dir}\n\n"
-                f"包含文件：\n"
-                + "".join(file_list)
-            )
+            zip_path = None
+            if self.chk_zip.isChecked():
+                plate_clean = pkg.vehicle_plate.replace("·", "").replace("·", "")
+                zip_name = f"{pkg.record_id}_{plate_clean}_证据包.zip"
+                zip_path = os.path.join(out_dir, zip_name)
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for root, _, files in os.walk(pkg_dir):
+                        for fn in files:
+                            full = os.path.join(root, fn)
+                            arc = os.path.relpath(full, pkg_dir)
+                            zf.write(full, arcname=os.path.join(default_name, arc))
+
+            self.progress.setValue(100)
+            file_list = [f"  • {os.path.basename(readme_path)}（主文件，双击打开）\n"]
+            if csv_path:
+                file_list.append(f"  • {os.path.basename(csv_path)}\n")
+            if tlog_path:
+                file_list.append(f"  • {os.path.basename(tlog_path)}\n")
+            if driver_path:
+                file_list.append(f"  • {os.path.basename(driver_path)}\n")
+            if exported_attachments:
+                ok_count = sum(1 for a in exported_attachments if a["exists"])
+                miss_count = len(exported_attachments) - ok_count
+                if miss_count:
+                    file_list.append(f"  • attachments/  （实有 {ok_count} 张，缺失 {miss_count} 项，缺失项在说明文件中标红）\n")
+                else:
+                    file_list.append(f"  • attachments/  （含 {ok_count} 张照片/截图）\n")
+            if zip_path:
+                file_list.insert(0, f"\n  ZIP 压缩包：{zip_name}\n")
+
+            msg = f"证据包已导出至：\n{pkg_dir}\n\n包含文件：\n" + "".join(file_list)
+            if missing_attachments:
+                msg += f"\n⚠ 缺失 {len(missing_attachments)} 个附件原始文件，已在 Markdown 报告中醒目标注。\n"
+            if zip_path:
+                msg += f"\nZIP 打包完成：\n{zip_path}\n（可直接邮件/微信发送）"
+
+            QMessageBox.information(self, "导出成功", msg)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中发生错误：\n{e}")
         finally:
@@ -492,55 +637,6 @@ class ExportWindow(QWidget):
         for ch in invalid:
             name = name.replace(ch, "_")
         return name.strip().replace(" ", "_")[:60]
-
-    def _generate_placeholder_image(
-        self, save_path: str, desc: str, idx: int, total: int, plate: str
-    ):
-        pix = QPixmap(800, 450)
-        pix.fill(QColor("#F5F7FA"))
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        painter.setPen(QPen(QColor("#1976D2"), 3))
-        painter.setBrush(QBrush(QColor("#E3F2FD")))
-        painter.drawRoundedRect(20, 20, 760, 410, 12, 12)
-
-        if desc.startswith("[照片]"):
-            header = "📷  现场照片  |  %s" % plate
-            color = QColor("#C62828")
-        else:
-            header = "🗺  行驶轨迹截图  |  %s" % plate
-            color = QColor("#2E7D32")
-
-        painter.setPen(QPen(color, 2))
-        painter.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
-        painter.drawText(40, 60, header)
-
-        painter.setPen(QPen(QColor("#607D8B"), 1, Qt.DashLine))
-        painter.drawLine(40, 80, 760, 80)
-
-        painter.setPen(QPen(QColor("#263238"), 2))
-        painter.setFont(QFont("Microsoft YaHei", 13, QFont.DemiBold))
-        desc_clean = desc.replace("[照片] ", "").replace("[轨迹] ", "")
-        painter.drawText(40, 120, f"【{idx}/{total}】{desc_clean}")
-
-        painter.setPen(QPen(QColor("#546E7A"), 1))
-        painter.setFont(QFont("Microsoft YaHei", 11))
-        painter.drawText(
-            40, 160, 720, 200,
-            Qt.TextWordWrap | Qt.AlignTop,
-            "说明：本图片为证据包占位图。\n"
-            "实际使用时请替换为车载终端或司机手机拍摄的原始照片。\n"
-            "占位图仅用于证据包结构演示，确保附件清单可点击跳转。"
-        )
-
-        painter.setPen(QPen(QColor("#90A4AE"), 1))
-        painter.setFont(QFont("Consolas", 9))
-        painter.drawText(40, 410, f"证据包生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        painter.drawText(550, 410, f"文件：{os.path.basename(save_path)}")
-
-        painter.end()
-        pix.save(save_path, "PNG")
 
     def _build_readme_content(self, p: EvidencePackage, included_image_files: List[dict] = None) -> str:
         lines = []
@@ -557,22 +653,29 @@ class ExportWindow(QWidget):
         lines.append(f"- **导出时间**：{p.export_time.strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f"- **生成工具**：冷藏车断电复盘桌面工具 v1.0")
         lines.append("")
+        if p.responsibility_summary:
+            lines.append("## 二、责任链阶段分组说明")
+            lines.append("")
+            lines.append("```")
+            lines.append(p.responsibility_summary)
+            lines.append("```")
+            lines.append("")
         if p.timeline_summary:
-            lines.append("## 二、告警时间轴汇总")
+            lines.append("## 三、告警时间轴汇总")
             lines.append("")
             lines.append("```")
             lines.append(p.timeline_summary)
             lines.append("```")
             lines.append("")
         if p.impact_summary:
-            lines.append("## 三、温区影响评估结论")
+            lines.append("## 四、温区影响评估结论")
             lines.append("")
             lines.append("```")
             lines.append(p.impact_summary)
             lines.append("```")
             lines.append("")
         if p.driver_statement:
-            lines.append("## 四、司机书面处置说明")
+            lines.append("## 五、司机书面处置说明")
             lines.append("")
             lines.append("> 注：完整文本见同目录 `*_司机处置说明.txt`。")
             lines.append("")
@@ -581,21 +684,36 @@ class ExportWindow(QWidget):
             lines.append("```")
             lines.append("")
         if included_image_files:
-            lines.append("## 五、附件清单（点击可直接打开对应文件）")
+            ok_count = sum(1 for a in included_image_files if a["exists"])
+            miss_count = len(included_image_files) - ok_count
+            lines.append("## 六、附件清单（现场照片 / 轨迹截图）")
             lines.append("")
-            lines.append("| 序号 | 类型 | 缩略图 | 说明 |")
-            lines.append("| --- | --- | --- | --- |")
+            if miss_count:
+                lines.append(f"> <span style=\"color:#C62828;font-weight:600;\">**注意**：共 {len(included_image_files)} 项附件，其中 **{miss_count} 项原始文件缺失**，已在下表中用红色醒目标注。请尽快向车队或司机索取原始文件补全。</span>")
+                lines.append("")
+            lines.append("| 序号 | 类型 | 附件状态 | 说明 | 链接 |")
+            lines.append("| --- | --- | --- | --- | --- |")
             for img in included_image_files:
-                rel_path = img["filename"].replace("\\", "/")
-                desc = img["desc"]
+                idx = img["index"]
                 tag = img["type"]
-                lines.append(
-                    f"| {img['index']} | {tag} | "
-                    f"[![{desc}]({rel_path}?w=200&h=110)]({rel_path}) | "
-                    f"[{desc}]({rel_path}) |"
-                )
+                desc = img["desc"]
+                if img["exists"] and img["filename"]:
+                    rel_path = img["filename"].replace("\\", "/")
+                    status_cell = "✅ 已导出"
+                    link_cell = f"[点击打开原图]({rel_path})"
+                    desc_cell = desc
+                else:
+                    orig = img.get("orig_path", "(原始路径未记录)")
+                    status_cell = "<span style=\"color:#C62828;font-weight:700;\">❌ 文件缺失</span>"
+                    desc_cell = f"<span style=\"color:#C62828;\">{desc}　**【原始文件缺失，请向相关人员索取补全】**</span>"
+                    link_cell = f"<span style=\"color:#C62828;\">原始路径：`{orig}`</span>"
+                lines.append(f"| {idx} | {tag} | {status_cell} | {desc_cell} | {link_cell} |")
             lines.append("")
-            lines.append("> **使用说明**：点击表格中的缩略图或蓝色链接文字，即可直接打开对应图片文件。")
+            if ok_count:
+                lines.append("> **使用说明**：表格中状态为「✅ 已导出」的附件，其原图已复制到 `attachments/` 目录，点击蓝色链接可直接打开。")
+            if miss_count:
+                lines.append("")
+                lines.append("> **缺失项说明**：标记为「❌ 文件缺失」的附件，在当前系统中未找到对应原始文件，可能原因：拍摄后未上传、存储路径变更、硬盘介质损坏等。建议在发送证据包前，联系车队/司机补充缺失的现场照片。")
             lines.append("")
         lines.append("---")
         lines.append("")

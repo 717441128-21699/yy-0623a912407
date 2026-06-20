@@ -1,14 +1,17 @@
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 
 from PySide6.QtCore import Qt, QRectF, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QBrush, QPainterPath
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
-    QFrame, QSizePolicy, QGraphicsDropShadowEffect
+    QFrame, QSizePolicy, QGraphicsDropShadowEffect, QCheckBox
 )
 
-from .models import TransportRecord, AlertType, AlertSeverity, TemperatureReading
+from .models import (
+    TransportRecord, AlertType, AlertSeverity, TemperatureReading,
+    ResponsibilityPhase
+)
 
 
 ALERT_COLORS = {
@@ -28,6 +31,33 @@ ALERT_ICON = {
     AlertType.LOADING: "📦",
     AlertType.UNLOADING: "🏁",
 }
+
+
+PHASE_STYLES = {
+    ResponsibilityPhase.LOADING_SEAL: ("#2E7D32", "#E8F5E9", "📦", "装货封签"),
+    ResponsibilityPhase.DEPARTURE_POWER: ("#1565C0", "#E3F2FD", "🚚", "出发切换冷源"),
+    ResponsibilityPhase.EQUIPMENT_FAULT: ("#C62828", "#FFEBEE", "⚠", "设备故障"),
+    ResponsibilityPhase.DRIVER_RESPONSE: ("#E65100", "#FFF3E0", "👤", "司机响应"),
+    ResponsibilityPhase.MAINTENANCE_RECOVERY: ("#6A1B9A", "#F3E5F5", "🔧", "维修恢复"),
+    ResponsibilityPhase.NORMAL_TRANSIT: ("#455A64", "#ECEFF1", "🛣", "后续在途"),
+    ResponsibilityPhase.ARRIVAL_ACCEPTANCE: ("#00695C", "#E0F2F1", "🏁", "到货验收"),
+}
+
+
+def _phase_color(phase: ResponsibilityPhase):
+    return PHASE_STYLES.get(phase, ("#546E7A", "#F5F5F5", "●", ""))[0]
+
+
+def _phase_bg(phase: ResponsibilityPhase):
+    return PHASE_STYLES.get(phase, ("#546E7A", "#F5F5F5", "●", ""))[1]
+
+
+def _phase_icon(phase: ResponsibilityPhase):
+    return PHASE_STYLES.get(phase, ("#546E7A", "#F5F5F5", "●", ""))[2]
+
+
+def _phase_title(phase: ResponsibilityPhase):
+    return PHASE_STYLES.get(phase, ("#546E7A", "#F5F5F5", "●", phase.value))[3] + "阶段"
 
 
 class TimelineWindow(QWidget):
@@ -106,10 +136,31 @@ class TimelineWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        title_wrap = QHBoxLayout()
+        title_wrap.setContentsMargins(0, 0, 0, 0)
+
         title_bar = QLabel("  告警时间轴（按分钟排列）")
         title_bar.setObjectName("panelTitle")
         title_bar.setFixedHeight(40)
-        layout.addWidget(title_bar)
+
+        self.chk_group = QCheckBox("按责任链分组")
+        self.chk_group.setChecked(True)
+        self.chk_group.setCursor(Qt.PointingHandCursor)
+        self.chk_group.setStyleSheet(
+            "QCheckBox { padding: 0 14px 0 0; color: #1976D2; font-weight: 600; }"
+            "QCheckBox::indicator { width: 13px; height: 13px; border-radius: 3px; }"
+        )
+        self.chk_group.stateChanged.connect(lambda _=0: self._render_timeline())
+
+        title_wrap.addWidget(title_bar, 1)
+        title_wrap.addWidget(self.chk_group, 0, Qt.AlignVCenter)
+
+        title_wrap_w = QWidget()
+        title_wrap_w.setLayout(title_wrap)
+        title_wrap_w.setObjectName("panelTitle")
+        title_wrap_w.setStyleSheet("#panelTitle { background: #F8FAFC; border-bottom: 1px solid #ECEFF3; border-top-left-radius: 8px; border-top-right-radius: 8px; }")
+        title_wrap_w.setFixedHeight(40)
+        layout.addWidget(title_wrap_w)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -197,13 +248,101 @@ class TimelineWindow(QWidget):
             self.timeline_layout.addStretch(1)
             return
 
-        for idx, alert in enumerate(self._record.sorted_alerts()):
-            node = self._make_timeline_node(alert, idx == 0, idx == len(self._record.alerts) - 1)
-            self.timeline_layout.addWidget(node)
+        if self.chk_group.isChecked():
+            grouped = self._record.group_alerts_by_responsibility()
+            phase_list = list(grouped.keys())
+            for pidx, phase in enumerate(phase_list):
+                alerts_in_phase = grouped[phase]
+                if not alerts_in_phase:
+                    continue
+                banner = self._make_phase_banner(phase, alerts_in_phase)
+                self.timeline_layout.addWidget(banner)
+                for idx, alert in enumerate(alerts_in_phase):
+                    is_phase_first = (idx == 0) and (pidx == 0)
+                    is_phase_last = (idx == len(alerts_in_phase) - 1) and (pidx == len(phase_list) - 1)
+                    node = self._make_timeline_node(
+                        alert, is_phase_first, is_phase_last, phase,
+                        is_group_first=(idx == 0),
+                        is_group_last=(idx == len(alerts_in_phase) - 1),
+                    )
+                    self.timeline_layout.addWidget(node)
+        else:
+            for idx, alert in enumerate(self._record.sorted_alerts()):
+                node = self._make_timeline_node(alert, idx == 0, idx == len(self._record.alerts) - 1, None)
+                self.timeline_layout.addWidget(node)
 
         self.timeline_layout.addStretch(1)
 
-    def _make_timeline_node(self, alert, is_first: bool, is_last: bool) -> QWidget:
+    def _make_phase_banner(self, phase: ResponsibilityPhase, alerts: list) -> QWidget:
+        container = QWidget()
+        container.setMinimumHeight(38)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 8, 0, 4)
+        layout.setSpacing(8)
+
+        icon_lbl = QLabel(_phase_icon(phase))
+        icon_lbl.setFixedSize(28, 28)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        color = _phase_color(phase)
+        bg = _phase_bg(phase)
+        icon_lbl.setStyleSheet(
+            f"border-radius: 14px; background: {bg}; color: {color};"
+            f" font-size: 14px; font-weight: bold; border: 1px solid {color}66;"
+        )
+
+        title_wrap = QVBoxLayout()
+        title_wrap.setSpacing(0)
+        title_lbl = QLabel(_phase_title(phase))
+        title_lbl.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: 700;")
+        times = [a.timestamp for a in alerts]
+        t_start = min(times).strftime("%H:%M")
+        t_end = max(times).strftime("%H:%M")
+        count = len(alerts)
+        subtitle_text = f"{t_start} ~ {t_end}　共 {count} 个节点"
+        if phase == ResponsibilityPhase.DRIVER_RESPONSE:
+            cooler = [a for a in alerts if a.alert_type.name == "COOLER_STOP"]
+            confirm = [a for a in alerts if a.alert_type.name == "DRIVER_CONFIRM"]
+            if not cooler:
+                all_alerts = self._record.sorted_alerts()
+                cooler = [a for a in all_alerts if a.alert_type.name == "COOLER_STOP"]
+            if cooler and confirm:
+                lag = (confirm[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+                subtitle_text += f"　响应延迟 {lag:.0f} 分钟"
+        elif phase == ResponsibilityPhase.MAINTENANCE_RECOVERY:
+            all_alerts = self._record.sorted_alerts()
+            cooler = [a for a in all_alerts if a.alert_type.name == "COOLER_STOP"]
+            restore = [a for a in all_alerts if a.alert_type.name in ("POWER_RESTORE", "COOLER_RESTART")]
+            if cooler and restore:
+                lag = (restore[0].timestamp - cooler[0].timestamp).total_seconds() / 60
+                subtitle_text += f"　停机 → 恢复 {lag:.0f} 分钟"
+        sub_lbl = QLabel(subtitle_text)
+        sub_lbl.setStyleSheet("color: #546E7A; font-size: 11px;")
+        title_wrap.addWidget(title_lbl)
+        title_wrap.addWidget(sub_lbl)
+
+        layout.addWidget(icon_lbl, 0, Qt.AlignVCenter)
+        layout.addLayout(title_wrap, 1)
+        layout.addStretch(1)
+
+        left_bar = QFrame()
+        left_bar.setFixedWidth(3)
+        left_bar.setStyleSheet(f"background: {color}; border-radius: 2px;")
+        wrapper = QHBoxLayout()
+        wrapper.setContentsMargins(0, 0, 0, 0)
+        wrapper.setSpacing(8)
+        wrap_widget = QWidget()
+        wrap_widget.setLayout(wrapper)
+        wrapper.addWidget(left_bar)
+        wrapper.addWidget(container, 1)
+        wrap_widget.setStyleSheet(f"background: {bg}33; border-radius: 6px; padding: 2px 4px;")
+        return wrap_widget
+
+    def _make_timeline_node(
+        self, alert, is_first: bool, is_last: bool,
+        phase: Optional[ResponsibilityPhase] = None,
+        is_group_first: bool = False,
+        is_group_last: bool = False,
+    ) -> QWidget:
         container = QWidget()
         container.setMinimumHeight(74)
         root_layout = QHBoxLayout(container)
@@ -213,13 +352,20 @@ class TimelineWindow(QWidget):
         color = ALERT_COLORS[alert.severity]
         icon = ALERT_ICON.get(alert.alert_type, "●")
 
+        rail_color = "#E0E4EA"
+        if phase is not None:
+            rail_color = _phase_color(phase) + "99"
+
         rail_layout = QVBoxLayout()
         rail_layout.setContentsMargins(6, 0, 6, 0)
         rail_layout.setSpacing(0)
 
+        top_transparent = is_first or (phase is not None and is_group_first)
+        bottom_transparent = is_last or (phase is not None and is_group_last)
+
         line_top = QFrame()
         line_top.setFixedWidth(2)
-        line_top.setStyleSheet(f"background: {'transparent' if is_first else '#E0E4EA'};")
+        line_top.setStyleSheet(f"background: {'transparent' if top_transparent else rail_color};")
         line_top.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         dot = QLabel(icon)
@@ -237,7 +383,7 @@ class TimelineWindow(QWidget):
 
         line_bottom = QFrame()
         line_bottom.setFixedWidth(2)
-        line_bottom.setStyleSheet(f"background: {'transparent' if is_last else '#E0E4EA'};")
+        line_bottom.setStyleSheet(f"background: {'transparent' if bottom_transparent else rail_color};")
         line_bottom.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         rail_layout.addWidget(line_top, 1)

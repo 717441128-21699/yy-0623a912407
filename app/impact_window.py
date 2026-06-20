@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import (
-    TransportRecord, CargoConfig, CargoType, TemperatureReading, ImpactAssessment
+    TransportRecord, CargoConfig, CargoType, TemperatureReading, ImpactAssessment, TempScheme
 )
 
 
@@ -82,6 +82,27 @@ class ImpactWindow(QWidget):
         form_wrap = QVBoxLayout(scroll_content)
         form_wrap.setContentsMargins(16, 16, 16, 16)
         form_wrap.setSpacing(14)
+
+        group_scheme = QGroupBox("评估方案")
+        group_scheme.setObjectName("formGroup")
+        form_scheme = QFormLayout(group_scheme)
+        form_scheme.setSpacing(10)
+        form_scheme.setContentsMargins(14, 18, 14, 14)
+
+        self.cmb_scheme = QComboBox()
+        self.cmb_scheme.setObjectName("schemeCombo")
+        self.cmb_scheme.setMinimumHeight(30)
+        self.cmb_scheme.addItem("自定义（手动填写参数）", None)
+        self.cmb_scheme.currentIndexChanged.connect(self._apply_scheme)
+        self.lbl_scheme_desc = QLabel("可选择货主合同/保险条款/内部质控等预设方案，或手动自定义参数")
+        self.lbl_scheme_desc.setObjectName("schemeHint")
+        self.lbl_scheme_desc.setWordWrap(True)
+        self.lbl_scheme_desc.setStyleSheet("color: #546E7A; font-size: 11px;")
+
+        form_scheme.addRow("选择方案：", self.cmb_scheme)
+        form_scheme.addRow("", self.lbl_scheme_desc)
+
+        form_wrap.addWidget(group_scheme)
 
         group_cargo = QGroupBox("货品信息")
         group_cargo.setObjectName("formGroup")
@@ -209,6 +230,27 @@ class ImpactWindow(QWidget):
         stats_row.addWidget(self.card_peak["card"], 1)
         body.addLayout(stats_row)
 
+        compare_group = QGroupBox("多方案对比（货主合同 / 保险条款 / 内部质控）")
+        compare_group.setObjectName("formGroup")
+        cp_layout = QVBoxLayout(compare_group)
+        cp_layout.setContentsMargins(14, 18, 14, 14)
+        cp_layout.setSpacing(8)
+
+        self.txt_compare = QTextEdit()
+        self.txt_compare.setReadOnly(True)
+        self.txt_compare.setObjectName("compareTable")
+        self.txt_compare.setMinimumHeight(150)
+        self.txt_compare.setPlaceholderText(
+            "执行评估后，此处将展示三套业务口径的对比：\n"
+            "• 货主合同：最严谨，直接决定收货是否拒收\n"
+            "• 保险条款：决定是否立案赔付以及赔付比例\n"
+            "• 内部质控：车队内部考核与处罚依据\n"
+            "每行显示：温区范围 / 容忍时长 / 越线分钟 / 结论 / 风险等级"
+        )
+        cp_layout.addWidget(self.txt_compare)
+
+        body.addWidget(compare_group)
+
         detail_group = QGroupBox("责任链分析与建议")
         detail_group.setObjectName("formGroup")
         d_layout = QVBoxLayout(detail_group)
@@ -260,13 +302,56 @@ class ImpactWindow(QWidget):
 
     def set_record(self, record: TransportRecord):
         self._record = record
+        self._populate_schemes()
+
+    def _populate_schemes(self):
+        current_data = self.cmb_scheme.currentData()
+        self.cmb_scheme.blockSignals(True)
+        self.cmb_scheme.clear()
+        self.cmb_scheme.addItem("自定义（手动填写参数）", None)
+        if self._record and self._record.temp_schemes:
+            for s in self._record.temp_schemes:
+                self.cmb_scheme.addItem(f"【{s.scheme_type}】{s.name}", s)
+        self.cmb_scheme.blockSignals(False)
+        if current_data is None:
+            self.cmb_scheme.setCurrentIndex(0)
+        self.lbl_scheme_desc.setText(
+            "可选择货主合同/保险条款/内部质控等预设方案，或手动自定义参数"
+            + (f"　共已配置 {self.cmb_scheme.count() - 1} 套业务方案" if (self._record and self._record.temp_schemes) else "")
+        )
+
+    def _apply_scheme(self, idx: int):
+        scheme: Optional[TempScheme] = self.cmb_scheme.itemData(idx)
+        if not scheme:
+            self.lbl_scheme_desc.setText("已切换为【自定义】模式，可手动调整温区与容忍时长参数")
+            return
+        c = scheme.cargo
+        self.cmb_cargo_type.blockSignals(True)
+        ti = self.cmb_cargo_type.findData(c.cargo_type)
+        if ti >= 0:
+            self.cmb_cargo_type.setCurrentIndex(ti)
+        self.cmb_cargo_type.blockSignals(False)
+        self.edt_cargo_name.setText(c.cargo_name)
+        self.spn_temp_min.setValue(c.temp_min)
+        self.spn_temp_max.setValue(c.temp_max)
+        self.spn_tolerance.setValue(c.tolerance_minutes)
+        desc = f"已加载【{scheme.scheme_type}】{scheme.name}"
+        if scheme.description:
+            desc += f"　｜　{scheme.description}"
+        self.lbl_scheme_desc.setText(desc)
+        self.lbl_scheme_desc.setToolTip(scheme.description or "")
 
     def _load_from_record(self):
         if not self._record:
             QMessageBox.information(self, "提示", "请先导入运输记录。")
             return
         r = self._record
-        if r.cargo:
+        self.cmb_scheme.blockSignals(True)
+        if r.temp_schemes:
+            self.cmb_scheme.setCurrentIndex(1)
+            self._apply_scheme(1)
+        elif r.cargo:
+            self.cmb_scheme.setCurrentIndex(0)
             idx = self.cmb_cargo_type.findData(r.cargo.cargo_type)
             if idx >= 0:
                 self.cmb_cargo_type.setCurrentIndex(idx)
@@ -274,6 +359,7 @@ class ImpactWindow(QWidget):
             self.spn_temp_min.setValue(r.cargo.temp_min)
             self.spn_temp_max.setValue(r.cargo.temp_max)
             self.spn_tolerance.setValue(r.cargo.tolerance_minutes)
+        self.cmb_scheme.blockSignals(False)
         if r.loading_time:
             self.dt_loading.setDateTime(r.loading_time)
         if r.unloading_time:
@@ -287,6 +373,64 @@ class ImpactWindow(QWidget):
             self.spn_temp_max.setValue(preset["temp_max"])
             self.spn_tolerance.setValue(preset["tolerance"])
 
+    def _evaluate_one_scheme(
+        self, scheme_name: str, cargo: CargoConfig, analysis_start, analysis_end
+    ) -> Optional[ImpactAssessment]:
+        tmin = cargo.temp_min
+        tmax = cargo.temp_max
+        tolerance = cargo.tolerance_minutes
+        if tmin >= tmax or analysis_start >= analysis_end:
+            return None
+
+        result = self._analyze_temperature(
+            self._record.temperature_log, tmin, tmax, analysis_start, analysis_end
+        )
+        segments = result["segments"]
+        exceed_duration = result["total_minutes"]
+        exceed_start = result["first_exceed"]
+        exceed_end = result["last_exceed"]
+        peak_temp = result["peak_temp"]
+
+        affected_parts = []
+        if segments:
+            for i, seg in enumerate(segments, 1):
+                affected_parts.append(
+                    f"第{i}段 {seg.start.strftime('%H:%M')}~{seg.end.strftime('%H:%M')} ({seg.minutes}分钟)"
+                )
+            affected_period = "；".join(affected_parts)
+        elif exceed_start and exceed_end:
+            affected_period = (
+                f"{exceed_start.strftime('%m-%d %H:%M')} ~ "
+                f"{exceed_end.strftime('%m-%d %H:%M')}"
+            )
+        else:
+            affected_period = "无越线记录"
+
+        is_acceptable = exceed_duration <= tolerance
+        if is_acceptable and exceed_duration == 0:
+            conclusion = "温区全程稳定"
+            risk_level = "低"
+        elif is_acceptable:
+            conclusion = "未超过约定容忍时长"
+            risk_level = "中低"
+        else:
+            conclusion = "可能影响收货验收"
+            risk_level = "高"
+
+        return ImpactAssessment(
+            is_acceptable=is_acceptable,
+            exceed_duration_minutes=exceed_duration,
+            tolerance_minutes=tolerance,
+            peak_temperature=peak_temp or 0.0,
+            temp_min=tmin,
+            temp_max=tmax,
+            affected_period=affected_period,
+            conclusion=conclusion,
+            detail="",
+            risk_level=risk_level,
+            scheme_name=scheme_name,
+        )
+
     def _do_assessment(self):
         if not self._record:
             QMessageBox.warning(self, "缺少运输记录", "请先导入或加载运输记录数据。")
@@ -295,8 +439,8 @@ class ImpactWindow(QWidget):
         tmin = self.spn_temp_min.value()
         tmax = self.spn_temp_max.value()
         tolerance = self.spn_tolerance.value()
-        analysis_start = self.dt_loading.dateTime().toPython()
-        analysis_end = self.dt_unloading.dateTime().toPython()
+        analysis_start = self.dt_loading.dateTime().toPyDateTime()
+        analysis_end = self.dt_unloading.dateTime().toPyDateTime()
 
         if tmin >= tmax:
             QMessageBox.warning(self, "参数错误", "温度下限必须低于温度上限。")
@@ -304,6 +448,9 @@ class ImpactWindow(QWidget):
         if analysis_start >= analysis_end:
             QMessageBox.warning(self, "参数错误", "装货完成时间必须早于到达卸货地时间。")
             return
+
+        current_scheme: Optional[TempScheme] = self.cmb_scheme.currentData()
+        scheme_name = current_scheme.name if current_scheme else "自定义"
 
         cargo = CargoConfig(
             cargo_type=self.cmb_cargo_type.currentData(),
@@ -348,7 +495,7 @@ class ImpactWindow(QWidget):
                 peak_deviation = round(tmin - peak_temp, 1)
 
         if is_acceptable and exceed_duration == 0:
-            conclusion = "未超过约定容忍时长"
+            conclusion = "温区全程稳定"
             risk_level = "低"
         elif is_acceptable:
             conclusion = "未超过约定容忍时长"
@@ -374,10 +521,80 @@ class ImpactWindow(QWidget):
             conclusion=conclusion,
             detail=detail,
             risk_level=risk_level,
+            scheme_name=scheme_name,
         )
         self._current_assessment = assessment
+
+        # 生成多方案对比
+        comparisons = [assessment]
+        if self._record.temp_schemes:
+            for s in self._record.temp_schemes:
+                if current_scheme and s.name == current_scheme.name:
+                    continue  # 避免重复（当前方案已在首位）
+                r = self._evaluate_one_scheme(s.name, s.cargo, analysis_start, analysis_end)
+                if r:
+                    comparisons.append(r)
+
         self._render_assessment(assessment)
+        self._render_comparison(comparisons)
         self.assessment_changed.emit(assessment)
+
+    def _render_comparison(self, comparisons: List[ImpactAssessment]):
+        if not comparisons:
+            self.txt_compare.setPlainText("（无可对比方案）")
+            return
+        lines = []
+        lines.append("┌" + "─" * 16 + "┬" + "─" * 14 + "┬" + "─" * 10 + "┬" + "─" * 12 + "┬" + "─" * 18 + "┬" + "─" * 10 + "┐")
+        lines.append("│" + "评估方案".center(16) + "│" + "温区(℃)".center(14) + "│" + "容忍".center(10) + "│" + "越线分钟".center(12) + "│" + "结论".center(18) + "│" + "风险等级".center(10) + "│")
+        lines.append("├" + "─" * 16 + "┼" + "─" * 14 + "┼" + "─" * 10 + "┼" + "─" * 12 + "┼" + "─" * 18 + "┼" + "─" * 10 + "┤")
+        for a in comparisons:
+            name = (a.scheme_name or "自定义")[:15]
+            temp_range = f"{a.temp_min:.0f}~{a.temp_max:.0f}"
+            tol = f"{a.tolerance_minutes}分"
+            exceed = f"{a.exceed_duration_minutes}分"
+            if a.exceed_duration_minutes == 0:
+                marker = "●"
+                color_note = ""
+            elif a.is_acceptable:
+                marker = "▲"
+                color_note = ""
+            else:
+                marker = "✗"
+                color_note = ""
+            concl = f"{marker}{a.conclusion[:8]}"
+            risk = a.risk_level
+            lines.append(
+                "│" + name.center(16) + "│" + temp_range.center(14) + "│"
+                + tol.center(10) + "│" + exceed.center(12) + "│"
+                + concl.center(18) + "│" + risk.center(10) + "│"
+            )
+        lines.append("└" + "─" * 16 + "┴" + "─" * 14 + "┴" + "─" * 10 + "┴" + "─" * 12 + "┴" + "─" * 18 + "┴" + "─" * 10 + "┘")
+        lines.append("")
+        lines.append("符号说明：● 全程稳定  ▲ 短时越线但可接受  ✗ 超过容忍阈值")
+        lines.append("")
+        diff = []
+        ok = [c for c in comparisons if c.is_acceptable]
+        bad = [c for c in comparisons if not c.is_acceptable]
+        if ok and bad:
+            diff.append(
+                f"⚠ 方案差异：{len(bad)} 套方案判定「可能影响收货验收」，"
+                f"{len(ok)} 套方案判定「可接受」。"
+            )
+            if bad and ok:
+                worst = max(bad, key=lambda c: c.exceed_duration_minutes)
+                best = min(ok, key=lambda c: c.exceed_duration_minutes)
+                diff.append(
+                    f"  → 最严口径【{worst.scheme_name}】：超出容忍 {worst.exceed_duration_minutes - worst.tolerance_minutes} 分钟"
+                )
+                diff.append(
+                    f"  → 最松口径【{best.scheme_name}】：尚余容忍 {best.tolerance_minutes - best.exceed_duration_minutes} 分钟"
+                )
+        elif len(comparisons) > 1 and all(c.is_acceptable for c in comparisons):
+            diff.append("✓ 所有方案均判定可接受或温区稳定，但内部考核仍需参考严格口径。")
+        elif len(comparisons) > 1 and not any(c.is_acceptable for c in comparisons):
+            diff.append("✗ 所有口径均判定超过容忍时长，建议按最严重方案启动理赔流程。")
+        lines.extend(diff)
+        self.txt_compare.setPlainText("\n".join(lines))
 
     def _analyze_temperature(
         self, readings: List[TemperatureReading], tmin: float, tmax: float,

@@ -1,4 +1,5 @@
 import json
+import os
 import pickle
 from datetime import datetime, timedelta
 from typing import Optional
@@ -218,7 +219,8 @@ class MainWindow(QMainWindow):
     def _dict_to_record(self, d: dict) -> TransportRecord:
         from .models import (
             AlertEvent, TemperatureReading, CargoConfig,
-            AlertType, AlertSeverity, CargoType
+            AlertType, AlertSeverity, CargoType,
+            EvidenceAttachment, TempScheme
         )
         def parse_dt(s):
             if not s:
@@ -258,6 +260,55 @@ class MainWindow(QMainWindow):
                 temperature=float(t["temperature"]),
                 zone=t.get("zone", "default"),
             ))
+        attachments = []
+        if d.get("attachments"):
+            for a in d["attachments"]:
+                fp = a.get("file_path")
+                exists = bool(a.get("exists", False)) and fp and os.path.isfile(fp)
+                attachments.append(EvidenceAttachment(
+                    description=a.get("description", ""),
+                    category=a.get("category", "photo"),
+                    file_path=fp if exists else None,
+                    exists=exists,
+                ))
+        elif d.get("track_images") or d.get("photo_paths"):
+            for idx, ti in enumerate(d.get("track_images", [])):
+                attachments.append(EvidenceAttachment(
+                    description=str(ti), category="track",
+                    file_path=None, exists=False,
+                ))
+            for idx, pi in enumerate(d.get("photo_paths", [])):
+                attachments.append(EvidenceAttachment(
+                    description=str(pi), category="photo",
+                    file_path=None, exists=False,
+                ))
+
+        temp_schemes = []
+        if d.get("temp_schemes"):
+            for s in d["temp_schemes"]:
+                sc = s.get("cargo", {})
+                scheme_cargo = None
+                if sc and sc.get("cargo_type"):
+                    scheme_cargo = CargoConfig(
+                        cargo_type=CargoType[sc["cargo_type"]],
+                        cargo_name=sc.get("cargo_name", ""),
+                        temp_min=float(sc.get("temp_min", -25)),
+                        temp_max=float(sc.get("temp_max", -18)),
+                        tolerance_minutes=int(sc.get("tolerance_minutes", 45)),
+                        shipment_weight=float(sc.get("shipment_weight", 0)),
+                        shipment_value=float(sc.get("shipment_value", 0)),
+                    )
+                elif cargo:
+                    scheme_cargo = cargo
+                temp_schemes.append(TempScheme(
+                    name=s.get("name", "未命名方案"),
+                    cargo=scheme_cargo or cargo or CargoConfig(
+                        CargoType.FROZEN, "未命名", -25.0, -18.0, 45
+                    ),
+                    description=s.get("description", ""),
+                    scheme_type=s.get("scheme_type", "自定义"),
+                ))
+
         return TransportRecord(
             record_id=d["record_id"],
             vehicle_plate=d["vehicle_plate"],
@@ -271,9 +322,9 @@ class MainWindow(QMainWindow):
             cargo=cargo,
             alerts=alerts,
             temperature_log=tlog,
-            track_images=d.get("track_images", []),
             driver_notes=d.get("driver_notes", ""),
-            photo_paths=d.get("photo_paths", []),
+            attachments=attachments,
+            temp_schemes=temp_schemes,
         )
 
     def _save_record(self):
@@ -340,9 +391,33 @@ class MainWindow(QMainWindow):
                 }
                 for t in r.temperature_log
             ],
-            "track_images": r.track_images,
             "driver_notes": r.driver_notes,
-            "photo_paths": r.photo_paths,
+            "attachments": [
+                {
+                    "description": a.description,
+                    "category": a.category,
+                    "file_path": a.file_path,
+                    "exists": a.exists and bool(a.file_path) and os.path.isfile(a.file_path),
+                }
+                for a in (r.attachments or [])
+            ],
+            "temp_schemes": [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "scheme_type": s.scheme_type,
+                    "cargo": {
+                        "cargo_type": s.cargo.cargo_type.name if s.cargo else None,
+                        "cargo_name": s.cargo.cargo_name if s.cargo else None,
+                        "temp_min": s.cargo.temp_min if s.cargo else None,
+                        "temp_max": s.cargo.temp_max if s.cargo else None,
+                        "tolerance_minutes": s.cargo.tolerance_minutes if s.cargo else None,
+                        "shipment_weight": s.cargo.shipment_weight if s.cargo else 0,
+                        "shipment_value": s.cargo.shipment_value if s.cargo else 0,
+                    } if s.cargo else None,
+                }
+                for s in (r.temp_schemes or [])
+            ],
         }
 
     def _clear_record(self):
