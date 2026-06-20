@@ -163,7 +163,10 @@ class TransportRecord:
                 continue
             groups[ResponsibilityPhase.NORMAL_TRANSIT].append(a)
 
-        return {k: v for k, v in groups.items() if v}
+        non_empty = [(k, v) for k, v in groups.items() if v]
+        non_empty.sort(key=lambda kv: min(a.timestamp for a in kv[1]))
+        from collections import OrderedDict
+        return OrderedDict(non_empty)
 
 
 def timedelta_10min():
@@ -199,3 +202,4 @@ class EvidencePackage:
     driver_statement: str
     included_attachments: List[dict] = field(default_factory=list)
     responsibility_summary: str = ""
+    temp_scheme_comparison: str = ""

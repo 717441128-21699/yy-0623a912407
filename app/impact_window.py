@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox,
     QDoubleSpinBox, QSpinBox, QPushButton, QDateTimeEdit, QFormLayout,
-    QTextEdit, QSizePolicy, QGroupBox, QLineEdit, QMessageBox
+    QTextEdit, QSizePolicy, QGroupBox, QLineEdit, QMessageBox, QInputDialog
 )
 
 from .models import (
@@ -56,7 +56,11 @@ class ImpactWindow(QWidget):
         super().__init__(parent)
         self._record: Optional[TransportRecord] = None
         self._current_assessment: Optional[ImpactAssessment] = None
+        self._scheme_baseline: Optional[dict] = None
+        self._dirty = False
+        self._suppress_dirty = False
         self._build_ui()
+        self._connect_dirty_signals()
 
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -83,10 +87,10 @@ class ImpactWindow(QWidget):
         form_wrap.setContentsMargins(16, 16, 16, 16)
         form_wrap.setSpacing(14)
 
-        group_scheme = QGroupBox("评估方案")
+        group_scheme = QGroupBox("评估方案（可新增/保存多套口径）")
         group_scheme.setObjectName("formGroup")
         form_scheme = QFormLayout(group_scheme)
-        form_scheme.setSpacing(10)
+        form_scheme.setSpacing(8)
         form_scheme.setContentsMargins(14, 18, 14, 14)
 
         self.cmb_scheme = QComboBox()
@@ -94,12 +98,60 @@ class ImpactWindow(QWidget):
         self.cmb_scheme.setMinimumHeight(30)
         self.cmb_scheme.addItem("自定义（手动填写参数）", None)
         self.cmb_scheme.currentIndexChanged.connect(self._apply_scheme)
+
+        btn_scheme_row = QHBoxLayout()
+        btn_scheme_row.setSpacing(6)
+        self.btn_scheme_save_new = QPushButton("另存为新方案")
+        self.btn_scheme_save_new.setObjectName("secondaryButton")
+        self.btn_scheme_save_new.setCursor(Qt.PointingHandCursor)
+        self.btn_scheme_save_new.setMinimumHeight(26)
+        self.btn_scheme_save_new.clicked.connect(self._save_as_new_scheme)
+
+        self.btn_scheme_update = QPushButton("更新当前方案")
+        self.btn_scheme_update.setObjectName("secondaryButton")
+        self.btn_scheme_update.setCursor(Qt.PointingHandCursor)
+        self.btn_scheme_update.setMinimumHeight(26)
+        self.btn_scheme_update.clicked.connect(self._update_current_scheme)
+
+        self.btn_scheme_delete = QPushButton("删除方案")
+        self.btn_scheme_delete.setObjectName("secondaryButton")
+        self.btn_scheme_delete.setCursor(Qt.PointingHandCursor)
+        self.btn_scheme_delete.setMinimumHeight(26)
+        self.btn_scheme_delete.clicked.connect(self._delete_current_scheme)
+
+        btn_scheme_row.addWidget(self.btn_scheme_save_new)
+        btn_scheme_row.addWidget(self.btn_scheme_update)
+        btn_scheme_row.addWidget(self.btn_scheme_delete)
+
+        self.cmb_scheme_type = QComboBox()
+        self.cmb_scheme_type.addItem("货主合同", "货主合同")
+        self.cmb_scheme_type.addItem("保险条款", "保险条款")
+        self.cmb_scheme_type.addItem("内部质控", "内部质控")
+        self.cmb_scheme_type.addItem("自定义", "自定义")
+
+        self.edt_scheme_desc = QLineEdit()
+        self.edt_scheme_desc.setPlaceholderText("条款说明，如：收货合同第3.2条…")
+
         self.lbl_scheme_desc = QLabel("可选择货主合同/保险条款/内部质控等预设方案，或手动自定义参数")
         self.lbl_scheme_desc.setObjectName("schemeHint")
         self.lbl_scheme_desc.setWordWrap(True)
         self.lbl_scheme_desc.setStyleSheet("color: #546E7A; font-size: 11px;")
 
-        form_scheme.addRow("选择方案：", self.cmb_scheme)
+        self.lbl_dirty_hint = QLabel("")
+        self.lbl_dirty_hint.setObjectName("dirtyHint")
+        self.lbl_dirty_hint.setWordWrap(True)
+        self.lbl_dirty_hint.setStyleSheet("color: #E65100; font-size: 11px; font-weight: 600;")
+        self.lbl_dirty_hint.setVisible(False)
+
+        scheme_row = QHBoxLayout()
+        scheme_row.setSpacing(8)
+        scheme_row.addWidget(self.cmb_scheme, 1)
+
+        form_scheme.addRow("选择方案：", scheme_row)
+        form_scheme.addRow("", btn_scheme_row)
+        form_scheme.addRow("方案类型：", self.cmb_scheme_type)
+        form_scheme.addRow("条款说明：", self.edt_scheme_desc)
+        form_scheme.addRow("", self.lbl_dirty_hint)
         form_scheme.addRow("", self.lbl_scheme_desc)
 
         form_wrap.addWidget(group_scheme)
@@ -300,70 +352,46 @@ class ImpactWindow(QWidget):
             "unit": lbl_unit,
         }
 
-    def set_record(self, record: TransportRecord):
-        self._record = record
-        self._populate_schemes()
-
-    def _populate_schemes(self):
-        current_data = self.cmb_scheme.currentData()
-        self.cmb_scheme.blockSignals(True)
-        self.cmb_scheme.clear()
-        self.cmb_scheme.addItem("自定义（手动填写参数）", None)
-        if self._record and self._record.temp_schemes:
-            for s in self._record.temp_schemes:
-                self.cmb_scheme.addItem(f"【{s.scheme_type}】{s.name}", s)
-        self.cmb_scheme.blockSignals(False)
-        if current_data is None:
-            self.cmb_scheme.setCurrentIndex(0)
-        self.lbl_scheme_desc.setText(
-            "可选择货主合同/保险条款/内部质控等预设方案，或手动自定义参数"
-            + (f"　共已配置 {self.cmb_scheme.count() - 1} 套业务方案" if (self._record and self._record.temp_schemes) else "")
-        )
-
-    def _apply_scheme(self, idx: int):
-        scheme: Optional[TempScheme] = self.cmb_scheme.itemData(idx)
-        if not scheme:
-            self.lbl_scheme_desc.setText("已切换为【自定义】模式，可手动调整温区与容忍时长参数")
-            return
-        c = scheme.cargo
-        self.cmb_cargo_type.blockSignals(True)
-        ti = self.cmb_cargo_type.findData(c.cargo_type)
-        if ti >= 0:
-            self.cmb_cargo_type.setCurrentIndex(ti)
-        self.cmb_cargo_type.blockSignals(False)
-        self.edt_cargo_name.setText(c.cargo_name)
-        self.spn_temp_min.setValue(c.temp_min)
-        self.spn_temp_max.setValue(c.temp_max)
-        self.spn_tolerance.setValue(c.tolerance_minutes)
-        desc = f"已加载【{scheme.scheme_type}】{scheme.name}"
-        if scheme.description:
-            desc += f"　｜　{scheme.description}"
-        self.lbl_scheme_desc.setText(desc)
-        self.lbl_scheme_desc.setToolTip(scheme.description or "")
-
     def _load_from_record(self):
         if not self._record:
             QMessageBox.information(self, "提示", "请先导入运输记录。")
             return
         r = self._record
-        self.cmb_scheme.blockSignals(True)
-        if r.temp_schemes:
-            self.cmb_scheme.setCurrentIndex(1)
-            self._apply_scheme(1)
-        elif r.cargo:
-            self.cmb_scheme.setCurrentIndex(0)
-            idx = self.cmb_cargo_type.findData(r.cargo.cargo_type)
-            if idx >= 0:
-                self.cmb_cargo_type.setCurrentIndex(idx)
-            self.edt_cargo_name.setText(r.cargo.cargo_name)
-            self.spn_temp_min.setValue(r.cargo.temp_min)
-            self.spn_temp_max.setValue(r.cargo.temp_max)
-            self.spn_tolerance.setValue(r.cargo.tolerance_minutes)
-        self.cmb_scheme.blockSignals(False)
-        if r.loading_time:
-            self.dt_loading.setDateTime(r.loading_time)
-        if r.unloading_time:
-            self.dt_unloading.setDateTime(r.unloading_time)
+        self._suppress_dirty = True
+        try:
+            if r.temp_schemes:
+                self._populate_schemes(select_name=r.temp_schemes[0].name)
+                first_scheme: Optional[TempScheme] = self.cmb_scheme.currentData()
+                if first_scheme and first_scheme.cargo:
+                    c = first_scheme.cargo
+                    ti = self.cmb_cargo_type.findData(c.cargo_type)
+                    if ti >= 0:
+                        self.cmb_cargo_type.setCurrentIndex(ti)
+                    self.edt_cargo_name.setText(c.cargo_name)
+                    self.spn_temp_min.setValue(c.temp_min)
+                    self.spn_temp_max.setValue(c.temp_max)
+                    self.spn_tolerance.setValue(c.tolerance_minutes)
+                    t_idx = self.cmb_scheme_type.findData(first_scheme.scheme_type)
+                    if t_idx >= 0:
+                        self.cmb_scheme_type.setCurrentIndex(t_idx)
+                    self.edt_scheme_desc.setText(first_scheme.description)
+            elif r.cargo:
+                self._populate_schemes()
+                idx = self.cmb_cargo_type.findData(r.cargo.cargo_type)
+                if idx >= 0:
+                    self.cmb_cargo_type.setCurrentIndex(idx)
+                self.edt_cargo_name.setText(r.cargo.cargo_name)
+                self.spn_temp_min.setValue(r.cargo.temp_min)
+                self.spn_temp_max.setValue(r.cargo.temp_max)
+                self.spn_tolerance.setValue(r.cargo.tolerance_minutes)
+            if r.loading_time:
+                self.dt_loading.setDateTime(r.loading_time)
+            if r.unloading_time:
+                self.dt_unloading.setDateTime(r.unloading_time)
+            self._capture_baseline()
+        finally:
+            self._suppress_dirty = False
+        self._update_dirty_hint()
 
     def _apply_cargo_preset(self, idx: int):
         ctype: CargoType = self.cmb_cargo_type.itemData(idx)
@@ -372,6 +400,206 @@ class ImpactWindow(QWidget):
             self.spn_temp_min.setValue(preset["temp_min"])
             self.spn_temp_max.setValue(preset["temp_max"])
             self.spn_tolerance.setValue(preset["tolerance"])
+
+    def _connect_dirty_signals(self):
+        self.cmb_cargo_type.currentIndexChanged.connect(lambda _=0: self._check_dirty())
+        self.edt_cargo_name.textChanged.connect(lambda _=0: self._check_dirty())
+        self.spn_temp_min.valueChanged.connect(lambda _=0: self._check_dirty())
+        self.spn_temp_max.valueChanged.connect(lambda _=0: self._check_dirty())
+        self.spn_tolerance.valueChanged.connect(lambda _=0: self._check_dirty())
+        self.dt_loading.dateTimeChanged.connect(lambda _=0: self._check_dirty())
+        self.dt_unloading.dateTimeChanged.connect(lambda _=0: self._check_dirty())
+        self.cmb_scheme_type.currentIndexChanged.connect(lambda _=0: self._check_dirty())
+        self.edt_scheme_desc.textChanged.connect(lambda _=0: self._check_dirty())
+
+    def _capture_baseline(self):
+        self._suppress_dirty = True
+        try:
+            self._scheme_baseline = {
+                "cargo_type": self.cmb_cargo_type.currentData(),
+                "cargo_name": self.edt_cargo_name.text().strip(),
+                "temp_min": self.spn_temp_min.value(),
+                "temp_max": self.spn_temp_max.value(),
+                "tolerance": self.spn_tolerance.value(),
+                "loading": self.dt_loading.dateTime().toPyDateTime(),
+                "unloading": self.dt_unloading.dateTime().toPyDateTime(),
+                "scheme_type": self.cmb_scheme_type.currentData(),
+                "scheme_desc": self.edt_scheme_desc.text().strip(),
+            }
+            self._dirty = False
+        finally:
+            self._suppress_dirty = False
+        self._update_dirty_hint()
+
+    def _check_dirty(self):
+        if self._suppress_dirty or self._scheme_baseline is None:
+            return
+        cur = {
+            "cargo_type": self.cmb_cargo_type.currentData(),
+            "cargo_name": self.edt_cargo_name.text().strip(),
+            "temp_min": self.spn_temp_min.value(),
+            "temp_max": self.spn_temp_max.value(),
+            "tolerance": self.spn_tolerance.value(),
+            "loading": self.dt_loading.dateTime().toPyDateTime(),
+            "unloading": self.dt_unloading.dateTime().toPyDateTime(),
+            "scheme_type": self.cmb_scheme_type.currentData(),
+            "scheme_desc": self.edt_scheme_desc.text().strip(),
+        }
+        self._dirty = (cur != self._scheme_baseline)
+        self._update_dirty_hint()
+
+    def _update_dirty_hint(self):
+        cur_scheme: Optional[TempScheme] = self.cmb_scheme.currentData()
+        if cur_scheme is None:
+            if self._dirty:
+                self.lbl_dirty_hint.setText("● 当前为【自定义口径】：参数已手动调整，未保存为方案")
+                self.lbl_dirty_hint.setVisible(True)
+            else:
+                self.lbl_dirty_hint.setText("● 当前为【自定义口径】")
+                self.lbl_dirty_hint.setVisible(True)
+        else:
+            if self._dirty:
+                self.lbl_dirty_hint.setText(
+                    f"⚠ 当前方案【{cur_scheme.name}】参数已被手动修改，显示为自定义结果。"
+                    f"点击「更新当前方案」保存，或重新选择方案恢复原值。"
+                )
+                self.lbl_dirty_hint.setVisible(True)
+            else:
+                self.lbl_dirty_hint.setVisible(False)
+        self.btn_scheme_update.setEnabled(cur_scheme is not None)
+        self.btn_scheme_delete.setEnabled(cur_scheme is not None)
+
+    def _populate_schemes(self, select_name: Optional[str] = None):
+        self._suppress_dirty = True
+        try:
+            self.cmb_scheme.clear()
+            self.cmb_scheme.addItem("自定义（手动填写参数）", None)
+            target_idx = 0
+            if self._record and self._record.temp_schemes:
+                for i, s in enumerate(self._record.temp_schemes):
+                    self.cmb_scheme.addItem(f"【{s.scheme_type}】{s.name}", s)
+                    if select_name and s.name == select_name:
+                        target_idx = i + 1
+            self.cmb_scheme.setCurrentIndex(target_idx)
+        finally:
+            self._suppress_dirty = False
+        self.lbl_scheme_desc.setText(
+            "可选择货主合同/保险条款/内部质控等预设方案，或手动自定义参数"
+            + (f"　共已配置 {self.cmb_scheme.count() - 1} 套业务方案" if (self._record and self._record.temp_schemes) else "")
+        )
+
+    def set_record(self, record: TransportRecord):
+        self._record = record
+        self._populate_schemes()
+        self._capture_baseline()
+
+    def _apply_scheme(self, idx: int):
+        if self._suppress_dirty:
+            return
+        scheme: Optional[TempScheme] = self.cmb_scheme.itemData(idx)
+        self._suppress_dirty = True
+        try:
+            if not scheme:
+                self.lbl_scheme_desc.setText("已切换为【自定义】模式，可手动调整温区与容忍时长参数")
+                self.cmb_scheme_type.setCurrentIndex(self.cmb_scheme_type.findData("自定义"))
+                self.edt_scheme_desc.setText("")
+                self._capture_baseline()
+                self._update_dirty_hint()
+                if self._record and self._record.temperature_log:
+                    self._do_assessment(silent=True)
+                return
+            c = scheme.cargo
+            ti = self.cmb_cargo_type.findData(c.cargo_type)
+            if ti >= 0:
+                self.cmb_cargo_type.setCurrentIndex(ti)
+            self.edt_cargo_name.setText(c.cargo_name)
+            self.spn_temp_min.setValue(c.temp_min)
+            self.spn_temp_max.setValue(c.temp_max)
+            self.spn_tolerance.setValue(c.tolerance_minutes)
+            t_idx = self.cmb_scheme_type.findData(scheme.scheme_type)
+            if t_idx >= 0:
+                self.cmb_scheme_type.setCurrentIndex(t_idx)
+            self.edt_scheme_desc.setText(scheme.description)
+            desc = f"已加载【{scheme.scheme_type}】{scheme.name}"
+            if scheme.description:
+                desc += f"　｜　{scheme.description}"
+            self.lbl_scheme_desc.setText(desc)
+            self.lbl_scheme_desc.setToolTip(scheme.description or "")
+            self._capture_baseline()
+        finally:
+            self._suppress_dirty = False
+        self._update_dirty_hint()
+        if self._record and self._record.temperature_log:
+            self._do_assessment(silent=True)
+
+    def _current_cargo_from_ui(self) -> CargoConfig:
+        return CargoConfig(
+            cargo_type=self.cmb_cargo_type.currentData(),
+            cargo_name=self.edt_cargo_name.text().strip() or "未填写",
+            temp_min=self.spn_temp_min.value(),
+            temp_max=self.spn_temp_max.value(),
+            tolerance_minutes=self.spn_tolerance.value(),
+            shipment_weight=(self._record.cargo.shipment_weight if (self._record and self._record.cargo) else 0.0),
+            shipment_value=(self._record.cargo.shipment_value if (self._record and self._record.cargo) else 0.0),
+        )
+
+    def _save_as_new_scheme(self):
+        if not self._record:
+            QMessageBox.information(self, "提示", "请先导入运输记录。")
+            return
+        name, ok = QInputDialog.getText(
+            self, "另存为新方案",
+            "请输入方案名称（如：货主合同2025版、保险理赔阈值V3等）：",
+            text=f"新方案{len(self._record.temp_schemes) + 1}"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        for s in self._record.temp_schemes:
+            if s.name == name:
+                QMessageBox.warning(self, "名称冲突", f"已存在同名方案「{name}」，请换个名字或使用「更新当前方案」。")
+                return
+        scheme = TempScheme(
+            name=name,
+            scheme_type=self.cmb_scheme_type.currentData() or "自定义",
+            description=self.edt_scheme_desc.text().strip(),
+            cargo=self._current_cargo_from_ui(),
+        )
+        self._record.temp_schemes.append(scheme)
+        self._populate_schemes(select_name=name)
+        self._capture_baseline()
+        self._update_dirty_hint()
+        QMessageBox.information(self, "已保存", f"新方案「{name}」已保存到当前运输记录，保存记录文件后可永久保留。")
+
+    def _update_current_scheme(self):
+        cur: Optional[TempScheme] = self.cmb_scheme.currentData()
+        if not cur:
+            QMessageBox.information(self, "提示", "请先选择一个已保存的方案。")
+            return
+        cur.cargo = self._current_cargo_from_ui()
+        cur.scheme_type = self.cmb_scheme_type.currentData() or "自定义"
+        cur.description = self.edt_scheme_desc.text().strip()
+        self._populate_schemes(select_name=cur.name)
+        self._capture_baseline()
+        self._update_dirty_hint()
+        QMessageBox.information(self, "已更新", f"方案「{cur.name}」参数已更新。")
+
+    def _delete_current_scheme(self):
+        cur: Optional[TempScheme] = self.cmb_scheme.currentData()
+        if not cur:
+            QMessageBox.information(self, "提示", "请先选择一个已保存的方案。")
+            return
+        ret = QMessageBox.question(
+            self, "确认删除",
+            f"确定删除方案「{cur.name}」吗？删除后可通过重新加载记录恢复（未保存的话）。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if ret != QMessageBox.Yes:
+            return
+        self._record.temp_schemes = [s for s in self._record.temp_schemes if s.name != cur.name]
+        self._populate_schemes()
+        self._capture_baseline()
+        self._update_dirty_hint()
 
     def _evaluate_one_scheme(
         self, scheme_name: str, cargo: CargoConfig, analysis_start, analysis_end
@@ -431,9 +659,10 @@ class ImpactWindow(QWidget):
             scheme_name=scheme_name,
         )
 
-    def _do_assessment(self):
+    def _do_assessment(self, silent: bool = False):
         if not self._record:
-            QMessageBox.warning(self, "缺少运输记录", "请先导入或加载运输记录数据。")
+            if not silent:
+                QMessageBox.warning(self, "缺少运输记录", "请先导入或加载运输记录数据。")
             return
 
         tmin = self.spn_temp_min.value()
@@ -443,10 +672,12 @@ class ImpactWindow(QWidget):
         analysis_end = self.dt_unloading.dateTime().toPyDateTime()
 
         if tmin >= tmax:
-            QMessageBox.warning(self, "参数错误", "温度下限必须低于温度上限。")
+            if not silent:
+                QMessageBox.warning(self, "参数错误", "温度下限必须低于温度上限。")
             return
         if analysis_start >= analysis_end:
-            QMessageBox.warning(self, "参数错误", "装货完成时间必须早于到达卸货地时间。")
+            if not silent:
+                QMessageBox.warning(self, "参数错误", "装货完成时间必须早于到达卸货地时间。")
             return
 
         current_scheme: Optional[TempScheme] = self.cmb_scheme.currentData()
