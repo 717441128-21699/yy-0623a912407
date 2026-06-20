@@ -1,5 +1,12 @@
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, NamedTuple
+
+
+class ExceedSegment(NamedTuple):
+    start: datetime
+    end: datetime
+    minutes: int
+    peak_temp: float
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -288,9 +295,14 @@ class ImpactWindow(QWidget):
         tmin = self.spn_temp_min.value()
         tmax = self.spn_temp_max.value()
         tolerance = self.spn_tolerance.value()
+        analysis_start = self.dt_loading.dateTime().toPython()
+        analysis_end = self.dt_unloading.dateTime().toPython()
 
         if tmin >= tmax:
             QMessageBox.warning(self, "参数错误", "温度下限必须低于温度上限。")
+            return
+        if analysis_start >= analysis_end:
+            QMessageBox.warning(self, "参数错误", "装货完成时间必须早于到达卸货地时间。")
             return
 
         cargo = CargoConfig(
@@ -302,19 +314,30 @@ class ImpactWindow(QWidget):
         )
         self._record.cargo = cargo
 
-        exceed_readings, exceed_start, exceed_end, peak_temp = self._analyze_temperature(
-            self._record.temperature_log, tmin, tmax
+        result = self._analyze_temperature(
+            self._record.temperature_log, tmin, tmax, analysis_start, analysis_end
         )
-        exceed_duration = 0
-        if exceed_start and exceed_end:
-            exceed_duration = int((exceed_end - exceed_start).total_seconds() / 60)
+        exceed_readings = result["exceeded"]
+        segments = result["segments"]
+        exceed_duration = result["total_minutes"]
+        exceed_start = result["first_exceed"]
+        exceed_end = result["last_exceed"]
+        peak_temp = result["peak_temp"]
 
-        affected_period = "无越线记录"
-        if exceed_start and exceed_end:
+        affected_parts = []
+        if segments:
+            for i, seg in enumerate(segments, 1):
+                affected_parts.append(
+                    f"第{i}段 {seg.start.strftime('%H:%M')}~{seg.end.strftime('%H:%M')} ({seg.minutes}分钟)"
+                )
+            affected_period = "；".join(affected_parts)
+        elif exceed_start and exceed_end:
             affected_period = (
                 f"{exceed_start.strftime('%m-%d %H:%M')} ~ "
                 f"{exceed_end.strftime('%m-%d %H:%M')}"
             )
+        else:
+            affected_period = "无越线记录"
 
         is_acceptable = exceed_duration <= tolerance
         peak_deviation = 0.0
@@ -336,7 +359,8 @@ class ImpactWindow(QWidget):
 
         detail = self._build_detail_text(
             is_acceptable, exceed_duration, tolerance, peak_temp, peak_deviation,
-            exceed_start, exceed_end, affected_period, cargo
+            exceed_start, exceed_end, affected_period, cargo, segments,
+            analysis_start, analysis_end
         )
 
         assessment = ImpactAssessment(
@@ -356,37 +380,113 @@ class ImpactWindow(QWidget):
         self.assessment_changed.emit(assessment)
 
     def _analyze_temperature(
-        self, readings: List[TemperatureReading], tmin: float, tmax: float
-    ) -> Tuple[List[TemperatureReading], Optional[datetime], Optional[datetime], Optional[float]]:
+        self, readings: List[TemperatureReading], tmin: float, tmax: float,
+        start_dt: datetime, end_dt: datetime
+    ) -> dict:
         if not readings:
-            return [], None, None, None
-        exceeded = [r for r in readings if r.temperature < tmin or r.temperature > tmax]
+            return {
+                "exceeded": [],
+                "segments": [],
+                "total_minutes": 0,
+                "first_exceed": None,
+                "last_exceed": None,
+                "peak_temp": None,
+                "analysis_start": start_dt,
+                "analysis_end": end_dt,
+            }
+
+        in_range = [
+            r for r in readings
+            if start_dt <= r.timestamp <= end_dt
+        ]
+        exceeded = [r for r in in_range if r.temperature < tmin or r.temperature > tmax]
+
         if not exceeded:
-            return [], None, None, None
-        start = exceeded[0].timestamp
-        end = exceeded[-1].timestamp
+            return {
+                "exceeded": [],
+                "segments": [],
+                "total_minutes": 0,
+                "first_exceed": None,
+                "last_exceed": None,
+                "peak_temp": None,
+                "analysis_start": start_dt,
+                "analysis_end": end_dt,
+            }
+
+        segments: List[ExceedSegment] = []
+        current_seg: List[TemperatureReading] = []
+
+        sorted_readings = sorted(in_range, key=lambda r: r.timestamp)
+        for r in sorted_readings:
+            is_exceed = r.temperature < tmin or r.temperature > tmax
+            if is_exceed:
+                current_seg.append(r)
+            else:
+                if current_seg:
+                    if len(current_seg) >= 1:
+                        seg_start = current_seg[0].timestamp
+                        seg_end = current_seg[-1].timestamp
+                        minutes = max(1, int((seg_end - seg_start).total_seconds() / 60) + 1)
+                        peak = max(current_seg, key=lambda x: abs(x.temperature - ((tmin + tmax) / 2))).temperature
+                        segments.append(ExceedSegment(seg_start, seg_end, minutes, peak))
+                    current_seg = []
+
+        if current_seg:
+            seg_start = current_seg[0].timestamp
+            seg_end = current_seg[-1].timestamp
+            minutes = max(1, int((seg_end - seg_start).total_seconds() / 60) + 1)
+            peak = max(current_seg, key=lambda x: abs(x.temperature - ((tmin + tmax) / 2))).temperature
+            segments.append(ExceedSegment(seg_start, seg_end, minutes, peak))
+
+        total_minutes = sum(s.minutes for s in segments)
         peak = max(exceeded, key=lambda r: abs(r.temperature - ((tmin + tmax) / 2))).temperature
-        return exceeded, start, end, peak
+
+        return {
+            "exceeded": exceeded,
+            "segments": segments,
+            "total_minutes": total_minutes,
+            "first_exceed": exceeded[0].timestamp,
+            "last_exceed": exceeded[-1].timestamp,
+            "peak_temp": peak,
+            "analysis_start": start_dt,
+            "analysis_end": end_dt,
+        }
 
     def _build_detail_text(
         self, is_acceptable, exceed_dur, tolerance, peak_temp, peak_dev,
-        start, end, period, cargo
+        start, end, period, cargo, segments, analysis_start, analysis_end
     ) -> str:
         lines = []
         lines.append("═" * 38 + "  评估摘要  " + "═" * 38)
         lines.append(f"货品种类：{cargo.cargo_type.value}　　名称：{cargo.cargo_name}")
         lines.append(f"约定温区：{cargo.temp_min:.1f}℃ ~ {cargo.temp_max:.1f}℃　　容忍越线：{tolerance} 分钟")
+        lines.append(
+            f"评估区间：{analysis_start.strftime('%Y-%m-%d %H:%M')} ~ {analysis_end.strftime('%Y-%m-%d %H:%M')}"
+            "（装货完成 → 到达卸货地）"
+        )
         lines.append("")
         lines.append("─" * 88)
         lines.append("【一】温度异常时段")
-        if start and end:
+        if segments:
+            lines.append(f"  • 分段异常明细（共 {len(segments)} 段，仅累加越线分钟，不含中间正常时段）：")
+            for i, seg in enumerate(segments, 1):
+                lines.append(
+                    f"     第{i}段：{seg.start.strftime('%Y-%m-%d %H:%M')} ~ "
+                    f"{seg.end.strftime('%H:%M')}　持续 {seg.minutes} 分钟　峰值 {seg.peak_temp:.1f}℃"
+                )
+            lines.append(f"  • 越线累计时长：{exceed_dur} 分钟（{sum(s.minutes for s in segments)} 分钟 = {' + '.join(str(s.minutes) for s in segments)}）")
+            lines.append(f"  • 首次越线时间：{start.strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"  • 末次越线时间：{end.strftime('%Y-%m-%d %H:%M')}")
+            if peak_temp is not None:
+                lines.append(f"  • 全程温度峰值：{peak_temp:.1f}℃（偏离边界 {peak_dev:+.1f}℃）")
+        elif start and end:
             lines.append(f"  • 首次越线时间：{start.strftime('%Y-%m-%d %H:%M')}")
             lines.append(f"  • 恢复至正常温区时间：{end.strftime('%Y-%m-%d %H:%M')}")
             lines.append(f"  • 越线累计时长：{exceed_dur} 分钟")
             if peak_temp is not None:
                 lines.append(f"  • 温度峰值：{peak_temp:.1f}℃（偏离边界 {peak_dev:+.1f}℃）")
         else:
-            lines.append("  • 全程未检测到温度越线，运输过程温区稳定。")
+            lines.append("  • 评估区间内未检测到温度越线，运输过程温区稳定。")
 
         lines.append("")
         lines.append("【二】影响程度判断")
@@ -398,7 +498,7 @@ class ImpactWindow(QWidget):
             )
             lines.append(
                 "  • 结论：未超过约定容忍时长。结合货品品类特性，"
-                "该短暂越线通常不影响货品品质与收货验收。"
+                "该越线通常不影响货品品质与收货验收。"
             )
             if cargo.cargo_type == CargoType.FROZEN:
                 lines.append("  • 说明：冷冻货品热容量大，短时温升不致形成解冻循环。")

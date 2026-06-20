@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Optional, List
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QPainter, QColor, QFont, QPen, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QComboBox, QLineEdit, QCheckBox, QListWidget, QListWidgetItem,
@@ -401,21 +402,44 @@ class ExportWindow(QWidget):
             self.progress.setVisible(True)
             self.progress.setValue(10)
 
-            os.makedirs(out_dir, exist_ok=True)
-            base = os.path.join(out_dir, default_name)
+            pkg_dir = os.path.join(out_dir, default_name)
+            os.makedirs(pkg_dir, exist_ok=True)
+            attachments_dir = os.path.join(pkg_dir, "attachments")
+            os.makedirs(attachments_dir, exist_ok=True)
+
+            base = os.path.join(pkg_dir, default_name)
+
+            self.progress.setValue(25)
+            included_image_files = []
+            if self.chk_photos.isChecked() and pkg.included_images:
+                for i, name in enumerate(pkg.included_images, 1):
+                    tag = "photo" if name.startswith("[照片]") else "track"
+                    safe_name = f"{tag}_{i:02d}_{self._sanitize_filename(name)}.png"
+                    full_path = os.path.join(attachments_dir, safe_name)
+                    self._generate_placeholder_image(
+                        full_path, name, i, len(pkg.included_images),
+                        self._record.vehicle_plate if self._record else ""
+                    )
+                    included_image_files.append({
+                        "index": i,
+                        "type": "照片" if name.startswith("[照片]") else "轨迹截图",
+                        "desc": name.replace("[照片] ", "").replace("[轨迹] ", ""),
+                        "filename": os.path.join("attachments", safe_name),
+                    })
+                    self.progress.setValue(25 + int(40 * i / max(1, len(pkg.included_images))))
 
             readme_path = base + "_证据包说明.md"
-            self.progress.setValue(30)
+            self.progress.setValue(70)
             with open(readme_path, "w", encoding="utf-8") as f:
-                f.write(self._build_readme_content(pkg))
+                f.write(self._build_readme_content(pkg, included_image_files))
 
-            self.progress.setValue(55)
+            self.progress.setValue(80)
             if pkg.alert_records:
                 csv_path = base + "_告警记录.csv"
                 with open(csv_path, "w", encoding="utf-8-sig") as f:
                     f.write("\n".join(pkg.alert_records) + "\n")
 
-            self.progress.setValue(75)
+            self.progress.setValue(88)
             if self.chk_temp_log.isChecked() and self._record:
                 tlog_path = base + "_温度日志.csv"
                 with open(tlog_path, "w", encoding="utf-8-sig") as f:
@@ -426,7 +450,7 @@ class ExportWindow(QWidget):
                             f"{r.temperature:.1f},{r.zone}\n"
                         )
 
-            self.progress.setValue(90)
+            self.progress.setValue(94)
             driver_path = base + "_司机处置说明.txt"
             if pkg.driver_statement:
                 with open(driver_path, "w", encoding="utf-8") as f:
@@ -441,14 +465,21 @@ class ExportWindow(QWidget):
                     )
 
             self.progress.setValue(100)
+            file_list = [f"  • {os.path.relpath(readme_path, pkg_dir)}（主文件，双击打开）\n"]
+            if pkg.alert_records:
+                file_list.append(f"  • {os.path.relpath(csv_path, pkg_dir)}\n")
+            if self.chk_temp_log.isChecked() and self._record:
+                file_list.append(f"  • {os.path.relpath(tlog_path, pkg_dir)}\n")
+            if pkg.driver_statement:
+                file_list.append(f"  • {os.path.relpath(driver_path, pkg_dir)}\n")
+            if included_image_files:
+                file_list.append(f"  • attachments/  （含 {len(included_image_files)} 张照片/截图）\n")
+
             QMessageBox.information(
                 self, "导出成功",
-                f"证据包已导出至：\n{out_dir}\n\n"
+                f"证据包已导出至：\n{pkg_dir}\n\n"
                 f"包含文件：\n"
-                f"  • {os.path.basename(readme_path)}（主文件，可直接发送）\n"
-                + (f"  • {os.path.basename(csv_path)}\n" if pkg.alert_records else "")
-                + (f"  • {os.path.basename(tlog_path)}\n" if self.chk_temp_log.isChecked() and self._record else "")
-                + (f"  • {os.path.basename(driver_path)}\n" if pkg.driver_statement else "")
+                + "".join(file_list)
             )
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中发生错误：\n{e}")
@@ -456,7 +487,62 @@ class ExportWindow(QWidget):
             self.progress.setVisible(False)
             self.progress.setValue(0)
 
-    def _build_readme_content(self, p: EvidencePackage) -> str:
+    def _sanitize_filename(self, name: str) -> str:
+        invalid = '<>:"/\\|?*'
+        for ch in invalid:
+            name = name.replace(ch, "_")
+        return name.strip().replace(" ", "_")[:60]
+
+    def _generate_placeholder_image(
+        self, save_path: str, desc: str, idx: int, total: int, plate: str
+    ):
+        pix = QPixmap(800, 450)
+        pix.fill(QColor("#F5F7FA"))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        painter.setPen(QPen(QColor("#1976D2"), 3))
+        painter.setBrush(QBrush(QColor("#E3F2FD")))
+        painter.drawRoundedRect(20, 20, 760, 410, 12, 12)
+
+        if desc.startswith("[照片]"):
+            header = "📷  现场照片  |  %s" % plate
+            color = QColor("#C62828")
+        else:
+            header = "🗺  行驶轨迹截图  |  %s" % plate
+            color = QColor("#2E7D32")
+
+        painter.setPen(QPen(color, 2))
+        painter.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        painter.drawText(40, 60, header)
+
+        painter.setPen(QPen(QColor("#607D8B"), 1, Qt.DashLine))
+        painter.drawLine(40, 80, 760, 80)
+
+        painter.setPen(QPen(QColor("#263238"), 2))
+        painter.setFont(QFont("Microsoft YaHei", 13, QFont.DemiBold))
+        desc_clean = desc.replace("[照片] ", "").replace("[轨迹] ", "")
+        painter.drawText(40, 120, f"【{idx}/{total}】{desc_clean}")
+
+        painter.setPen(QPen(QColor("#546E7A"), 1))
+        painter.setFont(QFont("Microsoft YaHei", 11))
+        painter.drawText(
+            40, 160, 720, 200,
+            Qt.TextWordWrap | Qt.AlignTop,
+            "说明：本图片为证据包占位图。\n"
+            "实际使用时请替换为车载终端或司机手机拍摄的原始照片。\n"
+            "占位图仅用于证据包结构演示，确保附件清单可点击跳转。"
+        )
+
+        painter.setPen(QPen(QColor("#90A4AE"), 1))
+        painter.setFont(QFont("Consolas", 9))
+        painter.drawText(40, 410, f"证据包生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        painter.drawText(550, 410, f"文件：{os.path.basename(save_path)}")
+
+        painter.end()
+        pix.save(save_path, "PNG")
+
+    def _build_readme_content(self, p: EvidencePackage, included_image_files: List[dict] = None) -> str:
         lines = []
         lines.append(f"# {p.package_title}")
         lines.append("")
@@ -494,15 +580,22 @@ class ExportWindow(QWidget):
             lines.append(p.driver_statement)
             lines.append("```")
             lines.append("")
-        if p.included_images:
-            lines.append("## 五、附件清单")
+        if included_image_files:
+            lines.append("## 五、附件清单（点击可直接打开对应文件）")
             lines.append("")
-            lines.append("| 序号 | 附件类型 | 说明 |")
-            lines.append("| --- | --- | --- |")
-            for i, name in enumerate(p.included_images, 1):
-                tag = "照片" if name.startswith("[照片]") else "轨迹"
-                desc = name.replace("[照片] ", "").replace("[轨迹] ", "")
-                lines.append(f"| {i} | {tag} | {desc} |")
+            lines.append("| 序号 | 类型 | 缩略图 | 说明 |")
+            lines.append("| --- | --- | --- | --- |")
+            for img in included_image_files:
+                rel_path = img["filename"].replace("\\", "/")
+                desc = img["desc"]
+                tag = img["type"]
+                lines.append(
+                    f"| {img['index']} | {tag} | "
+                    f"[![{desc}]({rel_path}?w=200&h=110)]({rel_path}) | "
+                    f"[{desc}]({rel_path}) |"
+                )
+            lines.append("")
+            lines.append("> **使用说明**：点击表格中的缩略图或蓝色链接文字，即可直接打开对应图片文件。")
             lines.append("")
         lines.append("---")
         lines.append("")
