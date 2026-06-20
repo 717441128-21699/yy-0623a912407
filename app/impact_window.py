@@ -1,0 +1,503 @@
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox,
+    QDoubleSpinBox, QSpinBox, QPushButton, QDateTimeEdit, QFormLayout,
+    QTextEdit, QSizePolicy, QGroupBox, QLineEdit, QMessageBox
+)
+
+from .models import (
+    TransportRecord, CargoConfig, CargoType, TemperatureReading, ImpactAssessment
+)
+
+
+CARGO_PRESETS = {
+    CargoType.FROZEN: {
+        "temp_min": -25.0,
+        "temp_max": -18.0,
+        "tolerance": 45,
+    },
+    CargoType.CHILLED: {
+        "temp_min": 0.0,
+        "temp_max": 8.0,
+        "tolerance": 90,
+    },
+    CargoType.MEDICAL: {
+        "temp_min": 2.0,
+        "temp_max": 8.0,
+        "tolerance": 15,
+    },
+    CargoType.FRESH: {
+        "temp_min": 4.0,
+        "temp_max": 12.0,
+        "tolerance": 120,
+    },
+    CargoType.SPECIAL: {
+        "temp_min": -18.0,
+        "temp_max": -18.0,
+        "tolerance": 30,
+    },
+}
+
+
+class ImpactWindow(QWidget):
+    assessment_changed = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._record: Optional[TransportRecord] = None
+        self._current_assessment: Optional[ImpactAssessment] = None
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
+
+        root.addWidget(self._build_input_panel(), 5)
+        root.addWidget(self._build_result_panel(), 7)
+
+    def _build_input_panel(self) -> QWidget:
+        container = QFrame()
+        container.setProperty("role", "panel")
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        title = QLabel("  货品温区配置")
+        title.setObjectName("panelTitle")
+        title.setFixedHeight(40)
+        outer.addWidget(title)
+
+        scroll_content = QWidget()
+        form_wrap = QVBoxLayout(scroll_content)
+        form_wrap.setContentsMargins(16, 16, 16, 16)
+        form_wrap.setSpacing(14)
+
+        group_cargo = QGroupBox("货品信息")
+        group_cargo.setObjectName("formGroup")
+        form_cargo = QFormLayout(group_cargo)
+        form_cargo.setSpacing(10)
+        form_cargo.setContentsMargins(14, 18, 14, 14)
+
+        self.cmb_cargo_type = QComboBox()
+        for t in CargoType:
+            self.cmb_cargo_type.addItem(t.value, t)
+        self.cmb_cargo_type.currentIndexChanged.connect(self._apply_cargo_preset)
+
+        self.edt_cargo_name = QLineEdit()
+        self.edt_cargo_name.setPlaceholderText("如：进口阿根廷去骨牛腩")
+
+        form_cargo.addRow("货品类型：", self.cmb_cargo_type)
+        form_cargo.addRow("货品名称：", self.edt_cargo_name)
+
+        group_temp = QGroupBox("温度参数（单位：℃）")
+        group_temp.setObjectName("formGroup")
+        form_temp = QFormLayout(group_temp)
+        form_temp.setSpacing(10)
+        form_temp.setContentsMargins(14, 18, 14, 14)
+
+        self.spn_temp_max = QDoubleSpinBox()
+        self.spn_temp_max.setRange(-60, 40)
+        self.spn_temp_max.setDecimals(1)
+        self.spn_temp_max.setSingleStep(0.5)
+
+        self.spn_temp_min = QDoubleSpinBox()
+        self.spn_temp_min.setRange(-60, 40)
+        self.spn_temp_min.setDecimals(1)
+        self.spn_temp_min.setSingleStep(0.5)
+
+        self.spn_tolerance = QSpinBox()
+        self.spn_tolerance.setRange(0, 1440)
+        self.spn_tolerance.setSuffix(" 分钟")
+
+        form_temp.addRow("温度下限：", self.spn_temp_min)
+        form_temp.addRow("温度上限：", self.spn_temp_max)
+        form_temp.addRow("允许越线时长：", self.spn_tolerance)
+
+        group_nodes = QGroupBox("装卸节点（分钟级）")
+        group_nodes.setObjectName("formGroup")
+        form_nodes = QFormLayout(group_nodes)
+        form_nodes.setSpacing(10)
+        form_nodes.setContentsMargins(14, 18, 14, 14)
+
+        self.dt_loading = QDateTimeEdit()
+        self.dt_loading.setDisplayFormat("MM-dd HH:mm")
+        self.dt_loading.setCalendarPopup(True)
+
+        self.dt_unloading = QDateTimeEdit()
+        self.dt_unloading.setDisplayFormat("MM-dd HH:mm")
+        self.dt_unloading.setCalendarPopup(True)
+
+        form_nodes.addRow("装货完成：", self.dt_loading)
+        form_nodes.addRow("到达卸货地：", self.dt_unloading)
+
+        btn_calc = QPushButton("执行影响评估")
+        btn_calc.setObjectName("primaryButton")
+        btn_calc.setCursor(Qt.PointingHandCursor)
+        btn_calc.setMinimumHeight(38)
+        btn_calc.clicked.connect(self._do_assessment)
+
+        btn_load_from_record = QPushButton("从运输记录读取")
+        btn_load_from_record.setObjectName("secondaryButton")
+        btn_load_from_record.setCursor(Qt.PointingHandCursor)
+        btn_load_from_record.setMinimumHeight(34)
+        btn_load_from_record.clicked.connect(self._load_from_record)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addWidget(btn_load_from_record)
+        btn_row.addWidget(btn_calc, 1)
+
+        form_wrap.addWidget(group_cargo)
+        form_wrap.addWidget(group_temp)
+        form_wrap.addWidget(group_nodes)
+        form_wrap.addLayout(btn_row)
+        form_wrap.addStretch(1)
+
+        outer.addWidget(scroll_content, 1)
+        return container
+
+    def _build_result_panel(self) -> QWidget:
+        container = QFrame()
+        container.setProperty("role", "panel")
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        title = QLabel("  温区影响评估结论")
+        title.setObjectName("panelTitle")
+        title.setFixedHeight(40)
+        outer.addWidget(title)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(16, 16, 16, 16)
+        body.setSpacing(14)
+
+        self.conclusion_banner = QFrame()
+        self.conclusion_banner.setObjectName("conclusionBanner")
+        banner_layout = QVBoxLayout(self.conclusion_banner)
+        banner_layout.setContentsMargins(20, 18, 20, 18)
+        banner_layout.setSpacing(6)
+
+        self.lbl_conclusion_title = QLabel("请先填写货品参数并执行评估")
+        self.lbl_conclusion_title.setObjectName("conclusionTitle")
+        self.lbl_conclusion_detail = QLabel("使用左侧表单填写货品类型、允许温度范围、装卸节点，点击「执行影响评估」查看结论。")
+        self.lbl_conclusion_detail.setObjectName("conclusionDetail")
+        self.lbl_conclusion_detail.setWordWrap(True)
+
+        banner_layout.addWidget(self.lbl_conclusion_title)
+        banner_layout.addWidget(self.lbl_conclusion_detail)
+        body.addWidget(self.conclusion_banner)
+
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(10)
+        self.card_duration = self._make_metric_card("实际越线时长", "—", "分钟")
+        self.card_tolerance = self._make_metric_card("约定容忍时长", "—", "分钟")
+        self.card_peak = self._make_metric_card("温度峰值偏差", "—", "℃")
+        stats_row.addWidget(self.card_duration["card"], 1)
+        stats_row.addWidget(self.card_tolerance["card"], 1)
+        stats_row.addWidget(self.card_peak["card"], 1)
+        body.addLayout(stats_row)
+
+        detail_group = QGroupBox("责任链分析与建议")
+        detail_group.setObjectName("formGroup")
+        d_layout = QVBoxLayout(detail_group)
+        d_layout.setContentsMargins(14, 18, 14, 14)
+        d_layout.setSpacing(8)
+
+        self.txt_detail = QTextEdit()
+        self.txt_detail.setReadOnly(True)
+        self.txt_detail.setObjectName("detailText")
+        self.txt_detail.setPlaceholderText(
+            "评估完成后，此处将显示完整的分析内容，包括：\n"
+            "• 温度异常开始与恢复的精确时间\n"
+            "• 超出约定容忍时长的具体分钟数\n"
+            "• 对收货验收、货品品质的影响判断\n"
+            "• 责任归属建议（设备故障/司机处置/不可抗力）\n"
+            "• 是否建议触发保险理赔流程"
+        )
+        d_layout.addWidget(self.txt_detail)
+
+        body.addWidget(detail_group, 1)
+
+        outer.addLayout(body, 1)
+        return container
+
+    def _make_metric_card(self, label: str, value: str, unit: str) -> dict:
+        card = QFrame()
+        card.setObjectName("metricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+        lbl_label = QLabel(label)
+        lbl_label.setObjectName("metricLabel")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        lbl_value = QLabel(value)
+        lbl_value.setObjectName("metricValue")
+        lbl_unit = QLabel(unit)
+        lbl_unit.setObjectName("metricUnit")
+        row.addWidget(lbl_value)
+        row.addWidget(lbl_unit)
+        row.addStretch(1)
+        layout.addWidget(lbl_label)
+        layout.addLayout(row)
+        return {
+            "card": card,
+            "value": lbl_value,
+            "unit": lbl_unit,
+        }
+
+    def set_record(self, record: TransportRecord):
+        self._record = record
+
+    def _load_from_record(self):
+        if not self._record:
+            QMessageBox.information(self, "提示", "请先导入运输记录。")
+            return
+        r = self._record
+        if r.cargo:
+            idx = self.cmb_cargo_type.findData(r.cargo.cargo_type)
+            if idx >= 0:
+                self.cmb_cargo_type.setCurrentIndex(idx)
+            self.edt_cargo_name.setText(r.cargo.cargo_name)
+            self.spn_temp_min.setValue(r.cargo.temp_min)
+            self.spn_temp_max.setValue(r.cargo.temp_max)
+            self.spn_tolerance.setValue(r.cargo.tolerance_minutes)
+        if r.loading_time:
+            self.dt_loading.setDateTime(r.loading_time)
+        if r.unloading_time:
+            self.dt_unloading.setDateTime(r.unloading_time)
+
+    def _apply_cargo_preset(self, idx: int):
+        ctype: CargoType = self.cmb_cargo_type.itemData(idx)
+        preset = CARGO_PRESETS.get(ctype)
+        if preset:
+            self.spn_temp_min.setValue(preset["temp_min"])
+            self.spn_temp_max.setValue(preset["temp_max"])
+            self.spn_tolerance.setValue(preset["tolerance"])
+
+    def _do_assessment(self):
+        if not self._record:
+            QMessageBox.warning(self, "缺少运输记录", "请先导入或加载运输记录数据。")
+            return
+
+        tmin = self.spn_temp_min.value()
+        tmax = self.spn_temp_max.value()
+        tolerance = self.spn_tolerance.value()
+
+        if tmin >= tmax:
+            QMessageBox.warning(self, "参数错误", "温度下限必须低于温度上限。")
+            return
+
+        cargo = CargoConfig(
+            cargo_type=self.cmb_cargo_type.currentData(),
+            cargo_name=self.edt_cargo_name.text().strip() or "未填写",
+            temp_min=tmin,
+            temp_max=tmax,
+            tolerance_minutes=tolerance,
+        )
+        self._record.cargo = cargo
+
+        exceed_readings, exceed_start, exceed_end, peak_temp = self._analyze_temperature(
+            self._record.temperature_log, tmin, tmax
+        )
+        exceed_duration = 0
+        if exceed_start and exceed_end:
+            exceed_duration = int((exceed_end - exceed_start).total_seconds() / 60)
+
+        affected_period = "无越线记录"
+        if exceed_start and exceed_end:
+            affected_period = (
+                f"{exceed_start.strftime('%m-%d %H:%M')} ~ "
+                f"{exceed_end.strftime('%m-%d %H:%M')}"
+            )
+
+        is_acceptable = exceed_duration <= tolerance
+        peak_deviation = 0.0
+        if peak_temp is not None:
+            if peak_temp > tmax:
+                peak_deviation = round(peak_temp - tmax, 1)
+            elif peak_temp < tmin:
+                peak_deviation = round(tmin - peak_temp, 1)
+
+        if is_acceptable and exceed_duration == 0:
+            conclusion = "未超过约定容忍时长"
+            risk_level = "低"
+        elif is_acceptable:
+            conclusion = "未超过约定容忍时长"
+            risk_level = "中低"
+        else:
+            conclusion = "可能影响收货验收"
+            risk_level = "高"
+
+        detail = self._build_detail_text(
+            is_acceptable, exceed_duration, tolerance, peak_temp, peak_deviation,
+            exceed_start, exceed_end, affected_period, cargo
+        )
+
+        assessment = ImpactAssessment(
+            is_acceptable=is_acceptable,
+            exceed_duration_minutes=exceed_duration,
+            tolerance_minutes=tolerance,
+            peak_temperature=peak_temp or 0.0,
+            temp_min=tmin,
+            temp_max=tmax,
+            affected_period=affected_period,
+            conclusion=conclusion,
+            detail=detail,
+            risk_level=risk_level,
+        )
+        self._current_assessment = assessment
+        self._render_assessment(assessment)
+        self.assessment_changed.emit(assessment)
+
+    def _analyze_temperature(
+        self, readings: List[TemperatureReading], tmin: float, tmax: float
+    ) -> Tuple[List[TemperatureReading], Optional[datetime], Optional[datetime], Optional[float]]:
+        if not readings:
+            return [], None, None, None
+        exceeded = [r for r in readings if r.temperature < tmin or r.temperature > tmax]
+        if not exceeded:
+            return [], None, None, None
+        start = exceeded[0].timestamp
+        end = exceeded[-1].timestamp
+        peak = max(exceeded, key=lambda r: abs(r.temperature - ((tmin + tmax) / 2))).temperature
+        return exceeded, start, end, peak
+
+    def _build_detail_text(
+        self, is_acceptable, exceed_dur, tolerance, peak_temp, peak_dev,
+        start, end, period, cargo
+    ) -> str:
+        lines = []
+        lines.append("═" * 38 + "  评估摘要  " + "═" * 38)
+        lines.append(f"货品种类：{cargo.cargo_type.value}　　名称：{cargo.cargo_name}")
+        lines.append(f"约定温区：{cargo.temp_min:.1f}℃ ~ {cargo.temp_max:.1f}℃　　容忍越线：{tolerance} 分钟")
+        lines.append("")
+        lines.append("─" * 88)
+        lines.append("【一】温度异常时段")
+        if start and end:
+            lines.append(f"  • 首次越线时间：{start.strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"  • 恢复至正常温区时间：{end.strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"  • 越线累计时长：{exceed_dur} 分钟")
+            if peak_temp is not None:
+                lines.append(f"  • 温度峰值：{peak_temp:.1f}℃（偏离边界 {peak_dev:+.1f}℃）")
+        else:
+            lines.append("  • 全程未检测到温度越线，运输过程温区稳定。")
+
+        lines.append("")
+        lines.append("【二】影响程度判断")
+        if not start:
+            lines.append("  • 本次运输温区控制完全符合约定，不影响收货验收。")
+        elif is_acceptable:
+            lines.append(
+                f"  • 越线时长 {exceed_dur} 分钟，小于约定容忍时长 {tolerance} 分钟。"
+            )
+            lines.append(
+                "  • 结论：未超过约定容忍时长。结合货品品类特性，"
+                "该短暂越线通常不影响货品品质与收货验收。"
+            )
+            if cargo.cargo_type == CargoType.FROZEN:
+                lines.append("  • 说明：冷冻货品热容量大，短时温升不致形成解冻循环。")
+            elif cargo.cargo_type == CargoType.MEDICAL:
+                lines.append("  • 说明：医药冷链容忍窗口较短，建议后续加强冷机预检查。")
+        else:
+            over = exceed_dur - tolerance
+            lines.append(
+                f"  • 越线时长 {exceed_dur} 分钟，超过约定容忍时长 {tolerance} 分钟（超出 {over} 分钟）。"
+            )
+            lines.append("  • 结论：可能影响收货验收。")
+            lines.append(
+                "  • 建议：收货方在卸货前逐托盘抽检外观（是否有解冻、软化、凝露），"
+                "并保留温度记录仪原始数据作为后续交涉依据。"
+            )
+            if peak_temp is not None and cargo.cargo_type == CargoType.FROZEN:
+                if peak_temp > -10:
+                    lines.append("  • 风险提示：峰值温度高于 -10℃，表层货品可能已部分解冻。")
+            elif cargo.cargo_type == CargoType.MEDICAL:
+                lines.append("  • 风险提示：医药冷链超出容忍窗口，建议直接启动偏差调查流程。")
+
+        lines.append("")
+        lines.append("【三】责任链还原建议")
+        if self._record:
+            driver_confirms = [
+                a for a in self._record.alerts
+                if a.alert_type.name == "DRIVER_CONFIRM"
+            ]
+            cooler_stop = [
+                a for a in self._record.alerts
+                if a.alert_type.name == "COOLER_STOP"
+            ]
+            restore = [
+                a for a in self._record.alerts
+                if a.alert_type.name in ("POWER_RESTORE", "COOLER_RESTART")
+            ]
+            if cooler_stop and driver_confirms:
+                lag = (driver_confirms[0].timestamp - cooler_stop[0].timestamp).total_seconds() / 60
+                lines.append(f"  • 冷机告警 → 司机首次确认：{lag:.0f} 分钟（行业建议 ≤ 10 分钟）")
+                if lag <= 10:
+                    lines.append("  • 司机响应及时，处置链路无明显延误。")
+                else:
+                    lines.append(f"  • 司机响应偏慢，存在 {lag - 10:.0f} 分钟的处置空窗。")
+            if restore and cooler_stop:
+                dt = (restore[0].timestamp - cooler_stop[0].timestamp).total_seconds() / 60
+                lines.append(f"  • 冷机停机 → 恢复供电：{dt:.0f} 分钟（含维修支援时间）")
+            lines.append("  • 以上节点均已在「告警时间轴」面板中标注，可作为责任划分客观依据。")
+
+        lines.append("")
+        lines.append("【四】理赔建议")
+        if not start:
+            lines.append("  • 无异常，无需理赔介入。")
+        elif is_acceptable:
+            lines.append("  • 未超出约定阈值，建议在运输服务考评中记录，不建议启动正式理赔。")
+        else:
+            lines.append("  • 超出约定容忍阈值，建议：")
+            lines.append("    1) 收集温度日志、告警时间轴、司机说明、现场照片组成证据包；")
+            lines.append("    2) 评估货品损失比例（抽检或全检）；")
+            lines.append("    3) 对照运输合同条款启动保险理赔或承运商赔付流程。")
+
+        lines.append("")
+        lines.append("═" * 88)
+        return "\n".join(lines)
+
+    def _render_assessment(self, a: ImpactAssessment):
+        self.card_duration["value"].setText(str(a.exceed_duration_minutes))
+        self.card_tolerance["value"].setText(str(a.tolerance_minutes))
+        if a.peak_temperature is not None and a.peak_temperature != 0.0:
+            peak_dev = 0.0
+            if a.peak_temperature > a.temp_max:
+                peak_dev = a.peak_temperature - a.temp_max
+            elif a.peak_temperature < a.temp_min:
+                peak_dev = a.temp_min - a.peak_temperature
+            self.card_peak["value"].setText(f"{peak_dev:+.1f}")
+        else:
+            self.card_peak["value"].setText("0.0")
+
+        if a.is_acceptable:
+            if a.exceed_duration_minutes == 0:
+                self.conclusion_banner.setProperty("status", "ok")
+                self.lbl_conclusion_title.setText("✓ 全程温区稳定，无越线记录")
+                self.lbl_conclusion_title.setStyleSheet("color: #2E7D32; font-size: 18px; font-weight: 700;")
+            else:
+                self.conclusion_banner.setProperty("status", "warn")
+                self.lbl_conclusion_title.setText(f"● {a.conclusion}（越线 {a.exceed_duration_minutes} 分钟）")
+                self.lbl_conclusion_title.setStyleSheet("color: #F57C00; font-size: 18px; font-weight: 700;")
+        else:
+            self.conclusion_banner.setProperty("status", "bad")
+            self.lbl_conclusion_title.setText(
+                f"✗ {a.conclusion}（超出容忍 {a.exceed_duration_minutes - a.tolerance_minutes} 分钟）"
+            )
+            self.lbl_conclusion_title.setStyleSheet("color: #C62828; font-size: 18px; font-weight: 700;")
+
+        self.lbl_conclusion_detail.setText(
+            f"异常时段：{a.affected_period}　　风险等级：{a.risk_level}"
+        )
+        self.txt_detail.setPlainText(a.detail)
+        self.conclusion_banner.style().unpolish(self.conclusion_banner)
+        self.conclusion_banner.style().polish(self.conclusion_banner)
+
+    def get_assessment(self) -> Optional[ImpactAssessment]:
+        return self._current_assessment
